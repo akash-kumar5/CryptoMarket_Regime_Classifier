@@ -1,50 +1,115 @@
+# src/hmm_labeler.py
 import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from hmmlearn import hmm
+import joblib
+import os
 
-def label_market_regime(df: pd.DataFrame, prefix: str = "5m") -> pd.DataFrame:
-    # Map columns dynamically based on prefix
-    close = f"close_{prefix}"
-    ema20 = f"EMA20_{prefix}"
-    ema50 = f"EMA50_{prefix}"
-    atr14 = f"ATR14_{prefix}"
-    bb = f"BB_Width_{prefix}"
-    adx = f"ADX14_{prefix}"
+def get_hmm_features(df, feature_list, n_components=10, scale=True, use_pca=True):
+    """
+    Prepares the feature set for the HMM by selecting, scaling, and applying PCA.
+    """
+    features = df[feature_list].copy()
+    features.dropna(inplace=True)
+    
+    scaler = None
+    if scale:
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(features)
+    else:
+        scaled_features = features.values
 
-    # Precompute rolling ATR mean
-    atr_mean_col = f"{atr14}_Mean20"
-    df[atr_mean_col] = df[atr14].rolling(window=20).mean()
+    pca_model = None
+    if use_pca:
+        pca_model = PCA(n_components=n_components)
+        prepared_features = pca_model.fit_transform(scaled_features)
+        print(f"PCA explained variance ratio: {np.sum(pca_model.explained_variance_ratio_):.4f}")
+    else:
+        prepared_features = scaled_features
+        
+    return prepared_features, scaler, pca_model
 
-    regimes = []
-    for _, row in df.iterrows():
-        if pd.isna(row[ema20]) or pd.isna(row[ema50]) or pd.isna(row[adx]) or pd.isna(row[bb]) or pd.isna(row[atr_mean_col]):
-            regimes.append("Undefined")
-            continue
+def train_hmm(features, n_states=3, n_iter=100, random_state=42):
+    """
+    Trains a Gaussian Hidden Markov Model.
+    """
+    model = hmm.GaussianHMM(n_components=n_states, 
+                            covariance_type="diag", 
+                            n_iter=n_iter, 
+                            random_state=random_state)
+    model.fit(features)
+    return model
 
-       # A more robust logical flow for regime classification
+def map_states_to_regimes(df, labels, main_tf='15m'):
+    """
+    Interprets the HMM states by analyzing their characteristics.
+    Handles 3, 4, or 6 states explicitly, falls back to generic otherwise.
+    """
+    df_labeled = df.copy()
+    df_labeled['state'] = labels
+    n_states = len(np.unique(labels))
+    
+    vol_col = f'atr_norm_{main_tf}'
+    trend_col = f'adx_{main_tf}'
+    
+    # Compute average volatility & trend per state
+    state_stats = df_labeled.groupby('state')[[vol_col, trend_col]].mean()
+    state_stats = state_stats.sort_values(by=vol_col)  # sort by volatility
+    
+    mapping = {}
 
-# 1. First, check if a clear trend exists (using a standard ADX threshold of 25)
-        if row[adx] >= 25:
-            if row[ema20] > row[ema50] and row[close] > row[ema50]:
-                regimes.append("Uptrend")
-            elif row[ema20] < row[ema50] and row[close] < row[ema50]:
-                regimes.append("Downtrend")
-            else:
-                # Catches cases where ADX is high but EMAs might be conflicting
-                regimes.append("Undefined")
-
-        # 2. If no clear trend exists, determine the non-trending regime
-        elif row[adx] < 25:
-            # A "Squeeze" is a range with very low volatility. We use BB_Width to check.
-            # Note: The 0.015 threshold is an example; you may need to adjust it.
-            if row[bb] < 0.015:
-                regimes.append("Squeeze")
-            else:
-                # If ADX is low but volatility isn't critically low, it's a normal range.
-                regimes.append("Range")
-
-        # 3. Fallback for any other case
+    if n_states == 3:
+        # --- Logic for 3 states (Squeeze, Range, Trend) ---
+        mapping[state_stats.index[0]] = 'Squeeze'
+        if state_stats.loc[state_stats.index[1], trend_col] > state_stats.loc[state_stats.index[2], trend_col]:
+            mapping[state_stats.index[1]] = 'Range'
+            mapping[state_stats.index[2]] = 'Trend'
         else:
-            regimes.append("Undefined")
+            mapping[state_stats.index[1]] = 'Trend'
+            mapping[state_stats.index[2]] = 'Range'
 
-        # Add result as new column
-    df[f"Regime_{prefix}"] = regimes
-    return df
+    elif n_states == 4:
+        # --- Logic for 4 states (Squeeze, Range, Mid-Vol Trend, High-Vol Trend) ---
+        mapping[state_stats.index[0]] = 'Squeeze'
+        mapping[state_stats.index[3]] = 'High-Vol Trend'
+        if state_stats.loc[state_stats.index[1], trend_col] > state_stats.loc[state_stats.index[2], trend_col]:
+            mapping[state_stats.index[1]] = 'Range'
+            mapping[state_stats.index[2]] = 'Mid-Vol Trend'
+        else:
+            mapping[state_stats.index[1]] = 'Mid-Vol Trend'
+            mapping[state_stats.index[2]] = 'Range'
+
+    elif n_states == 6:
+        # --- Logic for 6 states ---
+        # Sorted by volatility: [lowest → highest]
+        mapping[state_stats.index[0]] = 'Squeeze'
+        mapping[state_stats.index[5]] = 'Volatility Spike'
+        
+        # Two low/mid-vol states (likely ranges vs weak trends)
+        low_mid_states = [state_stats.index[1], state_stats.index[2]]
+        if state_stats.loc[low_mid_states[0], trend_col] > state_stats.loc[low_mid_states[1], trend_col]:
+            mapping[low_mid_states[0]] = 'Weak Trend'
+            mapping[low_mid_states[1]] = 'Range'
+        else:
+            mapping[low_mid_states[0]] = 'Range'
+            mapping[low_mid_states[1]] = 'Weak Trend'
+        
+        # Two higher-vol states (likely strong trends)
+        high_mid_states = [state_stats.index[3], state_stats.index[4]]
+        if state_stats.loc[high_mid_states[0], trend_col] > state_stats.loc[high_mid_states[1], trend_col]:
+            mapping[high_mid_states[0]] = 'Strong Trend'
+            mapping[high_mid_states[1]] = 'Choppy High-Vol'
+        else:
+            mapping[high_mid_states[0]] = 'Choppy High-Vol'
+            mapping[high_mid_states[1]] = 'Strong Trend'
+
+    else:
+        # Fallback for other numbers of states
+        for i, state_index in enumerate(state_stats.index):
+            mapping[state_index] = f"State_{i}"
+
+    return mapping
+
+

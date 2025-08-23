@@ -1,126 +1,83 @@
+# src/feature_engineering.py
 import pandas as pd
+import numpy as np
+import talib
 
-def ema(df, span):
-    return df['close'].ewm(span=span, adjust=False).mean()
-
-def rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    # Use ewm for correct smoothing
-    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-10) # Add epsilon to prevent division by zero
-    return 100 - (100 / (1 + rs))
-
-def macd_histogram(df, fast=12, slow=26, signal=9):
-    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line - signal_line
-
-def atr(df, period=14):
-    high_low = df['high'] - df['low']
-    high_close = abs(df['high'] - df['close'].shift())
-    low_close = abs(df['low'] - df['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-def bollinger_band_width(df, period=20):
-    sma = df['close'].rolling(window=period).mean()
-    std = df['close'].rolling(window=period).std()
-    upper_band = sma + (2 * std)
-    lower_band = sma - (2 * std)
-    return (upper_band - lower_band) / sma
-
-def adx(df, period=14):
-    # Make a copy to avoid side effects
-    df_ = df.copy()
+def build_features(df, main_tf='15m', context_tfs=['5m', '1h']):
+    """
+    Builds a comprehensive feature set from the merged multi-timeframe data.
+    Crucially, it shifts context features to prevent lookahead bias.
     
-    # Calculate True Range
-    high_low = df_['high'] - df_['low']
-    high_close = abs(df_['high'] - df_['close'].shift())
-    low_close = abs(df_['low'] - df_['close'].shift())
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    Args:
+        df (pd.DataFrame): The merged dataframe from data_cleaner.
+        main_tf (str): The primary timeframe for the model (e.g., '15m').
+        context_tfs (list): The other timeframes providing context.
+
+    Returns:
+        pd.DataFrame: DataFrame with all features and OHLCV data, ready for modeling.
+    """
     
-    # Calculate Directional Movement
-    up_move = df_['high'] - df_['high'].shift(1)
-    down_move = df_['low'].shift(1) - df_['low']
-    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
-    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
-
-    # Use ewm for all smoothing steps (Wilder's method)
-    atr = tr.ewm(alpha=1/period, adjust=False).mean()
-    plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
-    minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / atr)
+    # Make a copy to avoid modifying the original dataframe
+    df_features = df.copy()
     
-    # Calculate DX and the final ADX
-    dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-10)) * 100
-    adx_line = dx.ewm(alpha=1/period, adjust=False).mean()
-    
-    return adx_line
+    all_timeframes = [main_tf] + context_tfs
 
-def compute_indicators(df):
-    df['EMA20'] = ema(df, 20)
-    df['EMA50'] = ema(df, 50)
-    df['EMA200'] = ema(df, 200)
-    df['RSI14'] = rsi(df)
-    df['MACD_Hist'] = macd_histogram(df)
-    df['ATR14'] =atr(df)
-    df['BB_Width'] = bollinger_band_width(df)
-    df['ADX14'] = adx(df)
-    
-    df.drop(['up_move', 'down_move', 'plus_dm', 'minus_dm', 'plus_di', 'minus_di'], axis=1, inplace=True, errors='ignore')
-
-    return df
-
-def compute_multi_tf_indicators(merged_df):
-    
-
-
-    dfs = []
-    timeframes = ['5m', '15m', '1h']
-    indicator_cols = ['EMA20', 'EMA50', 'EMA200', 'RSI14', 'MACD_Hist', 'ATR14', 'BB_Width', 'ADX14']
-
-    for tf in timeframes:
-        # Select columns for this timeframe + timestamp
-        cols = ['timestamp',
-                f'open_{tf}', f'high_{tf}', f'low_{tf}', f'close_{tf}', f'volume_{tf}']
-        print(merged_df[cols].tail(50).isna().sum())
-        # Drop rows with all NaNs for this timeframe (optional but cleaner)
-        subset = merged_df[cols].dropna(how='all', subset=cols[1:]).copy()
-
-        # Rename to expected column names for compute_indicators
-        subset.rename(columns={
-            f'open_{tf}': 'open',
-            f'high_{tf}': 'high',
-            f'low_{tf}': 'low',
-            f'close_{tf}': 'close',
-            f'volume_{tf}': 'volume'
-        }, inplace=True)
+    # --- 1. Calculate indicators for ALL timeframes ---
+    for tf in all_timeframes:
+        # Get the correct column names for the timeframe
+        close = df_features[f'close_{tf}']
+        high = df_features[f'high_{tf}']
+        low = df_features[f'low_{tf}']
+        volume = df_features[f'volume_{tf}']
         
+        # Returns
+        df_features[f'log_ret_1_{tf}'] = np.log(close / close.shift(1))
+        
+        # Trend
+        ema21 = talib.EMA(close, timeperiod=21)
+        ema55 = talib.EMA(close, timeperiod=55)
+        df_features[f'ema_slope_21_{tf}'] = (ema21 - ema21.shift(1))
+        df_features[f'price_vs_ema55_{tf}'] = close / ema55
+        _, _, df_features[f'macd_hist_{tf}'] = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+        df_features[f'adx_{tf}'] = talib.ADX(high, low, close, timeperiod=14)
+        
+        # Volatility
+        atr14 = talib.ATR(high, low, close, timeperiod=14)
+        df_features[f'atr_norm_{tf}'] = atr14 / close
+        upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2, nbdevdn=2, matype=0)
+        df_features[f'bb_width_{tf}'] = (upper - lower) / middle
+        df_features[f'realized_vol_20_{tf}'] = df_features[f'log_ret_1_{tf}'].rolling(window=20).std() * np.sqrt(20)
 
-        # Compute indicators on this subset
-        ind_df = compute_indicators(subset)
+        # Momentum
+        df_features[f'rsi_{tf}'] = talib.RSI(close, timeperiod=14)
+        df_features[f'roc_{tf}'] = talib.ROC(close, timeperiod=10)
+        df_features[f'stoch_k_{tf}'], _ = talib.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowd_period=3)
+        
+        # Microstructure
+        volume_mean_50 = volume.rolling(window=50).mean()
+        volume_std_50 = volume.rolling(window=50).std()
+        df_features[f'volume_zscore_50_{tf}'] = (volume - volume_mean_50) / volume_std_50
+        
+        body = abs(df_features[f'open_{tf}'] - close)
+        upper_wick = high - np.maximum(df_features[f'open_{tf}'], close)
+        lower_wick = np.minimum(df_features[f'open_{tf}'], close) - low
+        df_features[f'wick_ratio_{tf}'] = (upper_wick + lower_wick) / (body + 1e-6)
 
-        # Rename indicator cols to include timeframe suffix
-        ind_rename = {col: f"{col}_{tf}" for col in indicator_cols}
-        ind_df.rename(columns=ind_rename, inplace=True)
-
-        # Keep only timestamp + indicator cols
-        ind_df = ind_df[['timestamp'] + list(ind_rename.values())]
-        dfs.append(ind_df)
-
-    # Merge all indicator dfs on timestamp
-  # back-fill if needed
+    # --- 2. CRITICAL STEP: Shift context features to prevent leakage ---
+    # Identify all feature columns that are NOT from the main timeframe
+    feature_cols = [col for col in df_features.columns if not col.startswith(('open_', 'high_', 'low_', 'close_', 'volume_', 'timestamp'))]
     
-    final_df = merged_df.copy()
-    for ind_df in dfs:
-        final_df = final_df.merge(ind_df, on='timestamp', how='left')
-
-    final_df.sort_values('timestamp', inplace=True)
-    final_df.ffill(inplace=True)  # forward-fill all columns
-    final_df.bfill( inplace=True)
-    return final_df
+    context_feature_cols = []
+    for tf in context_tfs:
+        context_feature_cols.extend([col for col in feature_cols if col.endswith(f'_{tf}')])
+    
+    # Shift these context features by 1 bar.
+    # This ensures that at bar `t`, we only use context information available at the close of `t-1`.
+    df_features[context_feature_cols] = df_features[context_feature_cols].shift(1)
+    
+    # --- 3. Final Cleanup ---
+    # Drop rows with NaN values, which are created by indicator calculations and shifting
+    df_features.dropna(inplace=True)
+    
+    return df_features.reset_index(drop=True)
 

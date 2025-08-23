@@ -1,3 +1,4 @@
+# dashboard/pages/5_LSTM_Training.py
 import os
 import sys
 import json
@@ -5,170 +6,180 @@ import joblib
 import pandas as pd
 import numpy as np
 import streamlit as st
-import lightgbm as lgb
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import load_model
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 
-# Project paths
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Add project root to sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from src.lstm_model import create_sequences, build_lstm_model
+
 DATA_FOLDER = "data/"
 MODEL_FOLDER = "models/"
 
-st.title("Market Regime Model Training — LightGBM (5m target, 15m/1h as context)")
+st.set_page_config(page_title="LSTM Model Training", layout="wide")
+st.title("Train Regime Prediction Model (LSTM)")
+st.markdown("""
+This page trains an LSTM network to predict the HMM-generated market regime for the next bar.
+""")
 
-# ----- Load Data -----
-csv_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_labeled.csv")]
-if not csv_files:
-    st.warning("No _labeled.csv files found. Please label regimes first.")
+# ----- 1. Load Data -----
+try:
+    labeled_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_hmm_labels.csv")]
+except FileNotFoundError:
+    st.error(f"Data folder '{DATA_FOLDER}' not found.")
+    labeled_files = []
+
+if not labeled_files:
+    st.warning("No HMM-labeled files found. Please run 'HMM Labeling' first.")
     st.stop()
 
-selected_file = st.selectbox("Select labeled dataset", csv_files)
+selected_file = st.selectbox("Select HMM-labeled dataset", labeled_files)
 df = pd.read_csv(os.path.join(DATA_FOLDER, selected_file))
-st.subheader(f"Preview of {selected_file}")
-st.dataframe(df.tail(10))
 
-# ----- Config -----
-st.markdown("### Settings")
-test_size = st.slider("Test size (fraction at end of series)", 0.05, 0.4, 0.2, 0.01)
-early_stop_rounds = st.number_input("Early stopping rounds", min_value=10, max_value=1000, value=100, step=10)
-use_class_balance = st.checkbox("Balance classes (LightGBM class_weight)", value=True)
+# ----- 2. Target and Feature Preparation -----
+unique_regimes = sorted(df['regime'].dropna().unique())
+regime_map = {regime: idx for idx, regime in enumerate(unique_regimes)}
+inv_regime_map = {v: k for k, v in regime_map.items()}
+num_classes = len(regime_map)
 
-# ----- Label Encoding -----
-regime_map = {"Uptrend": 0, "Downtrend": 1, "Range": 2, "Squeeze": 3, "Undefined": -1}
-inv_regime_map = {v: k for k, v in regime_map.items() if v >= 0}
+df['target'] = df['regime'].map(regime_map)
+df['target'] = df['target'].shift(-1) # Predict next bar's regime
 
-if "Regime_5m" not in df.columns:
-    st.error("Missing 'Regime_5m' column. Your labeled dataset must include it.")
-    st.stop()
+feature_cols = [col for col in df.columns if not (
+    col.startswith(('open_', 'high_', 'low_', 'close_', 'volume_')) or
+    col in ['timestamp', 'state', 'regime', 'target']
+)]
 
-df["Regime_5m_label"] = df["Regime_5m"].map(regime_map)
+df.dropna(inplace=True)
+X_raw = df[feature_cols]
+y_raw = df['target'].astype(int)
 
-if "Regime_15m" in df.columns:
-    df["Regime_15m_ctx"] = df["Regime_15m"].map(regime_map)
-if "Regime_1h" in df.columns:
-    df["Regime_1h_ctx"] = df["Regime_1h"].map(regime_map)
-
-# ----- Features -----
-exclude_cols = {"timestamp", "Regime_5m", "Regime_15m", "Regime_1h"}
-candidate_cols = [c for c in df.columns if c not in exclude_cols]
-numeric_cols = [c for c in candidate_cols if pd.api.types.is_numeric_dtype(df[c])]
-
-target_col = "Regime_5m_label"
-df = df[df[target_col] >= 0].copy()
-df = df.dropna(subset=numeric_cols + [target_col])
-
-X = df[numeric_cols]
-y = df[target_col].astype(int)
-
-st.write(f"Total usable samples: {len(df)}")
-st.write(f"Features used: {len(numeric_cols)}")
-
-# ----- Split Data (time-based) -----
+# ----- 3. Train/Test Split -----
+st.sidebar.header("Data & Model Configuration")
+test_size = st.sidebar.slider("Test set size", 0.1, 0.5, 0.2, 0.05)
 n = len(df)
-test_n = max(1, int(n * test_size))
-train_n = n - test_n
+train_n = int(n * (1 - test_size))
 
-X_train, X_test = X.iloc[:train_n], X.iloc[train_n:]
-y_train, y_test = y.iloc[:train_n], y.iloc[train_n:]
+X_train_raw, X_test_raw = X_raw.iloc[:train_n], X_raw.iloc[train_n:]
+y_train_raw, y_test_raw = y_raw.iloc[:train_n], y_raw.iloc[train_n:]
 
-# validation split from tail of train
-val_n = max(1, int(len(X_train) * 0.1))
-X_tr, X_val = X_train.iloc[:-val_n], X_train.iloc[-val_n:]
-y_tr, y_val = y_train.iloc[:-val_n], y_train.iloc[-val_n:]
+# ----- 4. Scaling -----
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_raw)
+X_test_scaled = scaler.transform(X_test_raw)
 
-st.write(f"Train: {len(X_tr)} | Val: {len(X_val)} | Test: {len(X_test)}")
-st.write("Class distribution in training:", y_tr.value_counts().to_dict())
+# ----- 5. Create Sequences -----
+time_steps = st.sidebar.slider("LSTM Lookback Window (Time Steps)", 16, 128, 64, 4)
 
-# ----- Train -----
-if st.button("Train Model"):
-    clf = lgb.LGBMClassifier(
-        objective="multiclass",
-        num_class=4,
-        boosting_type="gbdt",
-        n_estimators=2000,
-        learning_rate=0.02,
-        num_leaves=64,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.1,
-        random_state=42,
-        n_jobs=-1,
-        class_weight="balanced" if use_class_balance else None,
+X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train_raw.values, time_steps)
+X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test_raw.values, time_steps)
+
+# One-hot encode the labels
+y_train_cat = to_categorical(y_train_seq, num_classes=num_classes)
+y_test_cat = to_categorical(y_test_seq, num_classes=num_classes)
+
+st.write(f"**Training sequences shape:** {X_train_seq.shape}")
+st.write(f"**Test sequences shape:** {X_test_seq.shape}")
+
+# ----- 6. Model Training -----
+st.sidebar.header("LSTM Architecture")
+lstm_units = st.sidebar.slider("LSTM Units", 32, 256, 96, 8)
+dense_units = st.sidebar.slider("Dense Units", 16, 128, 64, 8)
+dropout_rate = st.sidebar.slider("Dropout Rate", 0.1, 0.5, 0.3, 0.05)
+
+st.sidebar.header("Training Parameters")
+epochs = st.sidebar.number_input("Epochs", 10, 200, 50, 5)
+batch_size = st.sidebar.select_slider("Batch Size", options=[32, 64, 128, 256], value=128)
+
+if st.button("Train LSTM Model", type="primary"):
+    model = build_lstm_model(
+        input_shape=(X_train_seq.shape[1], X_train_seq.shape[2]),
+        num_classes=num_classes,
+        lstm_units=lstm_units,
+        dense_units=dense_units,
+        dropout_rate=dropout_rate
     )
+    st.write(model.summary())
 
-    clf.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        eval_metric="multi_logloss",
-        callbacks=[lgb.early_stopping(early_stop_rounds, verbose=False)]
-    )
+    callbacks = [
+        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+        ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-6)
+    ]
 
-    # ----- Eval -----
-    y_pred = clf.predict(X_test)
+    with st.spinner("Training LSTM model..."):
+        history = model.fit(
+            X_train_seq, y_train_cat,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=0.15, # Use last 15% of training data for validation
+            callbacks=callbacks,
+            verbose=1
+        )
+        st.session_state['lstm_model'] = model
+        st.session_state['lstm_history'] = history.history
+        st.session_state['scaler'] = scaler
 
-    unique_labels = sorted(set(y_test) | set(y_pred))
-    target_names = [inv_regime_map[i] for i in unique_labels]
+# ----- 7. Evaluation & Saving -----
+if 'lstm_model' in st.session_state:
+    st.success("Model training complete!")
+    model = st.session_state['lstm_model']
+    history = st.session_state['lstm_history']
+    scaler = st.session_state['scaler']
 
-    st.subheader("Classification Report (Test)")
-    report = classification_report(
-        y_test, y_pred,
-        labels=unique_labels,
-        target_names=target_names,
-        output_dict=True,
-        zero_division=0
-    )
-    st.dataframe(pd.DataFrame(report).transpose())
-
-    st.subheader("Confusion Matrix (Test)")
-    cm = confusion_matrix(y_test, y_pred, labels=unique_labels)
+    # Plot training history
+    st.subheader("Training & Validation Loss")
     fig, ax = plt.subplots()
-    sns.heatmap(
-        cm, annot=True, fmt="d", cmap="Blues",
-        xticklabels=target_names, yticklabels=target_names, ax=ax
-    )
-    ax.set_xlabel("Predicted")
-    ax.set_ylabel("True")
+    ax.plot(history['loss'], label='Training Loss')
+    ax.plot(history['val_loss'], label='Validation Loss')
+    ax.legend()
     st.pyplot(fig)
 
-    # ----- Feature Importance -----
-    st.subheader("Feature Importance (Gain)")
-    try:
-        importances = clf.booster_.feature_importance(importance_type="gain")
-        feature_names = clf.booster_.feature_name()
-    except Exception:
-        importances = clf.feature_importances_
-        feature_names = list(X.columns)
+    # Evaluate on test set
+    y_pred_probs = model.predict(X_test_seq)
+    y_pred = np.argmax(y_pred_probs, axis=1)
 
-    fi = pd.DataFrame({"Feature": feature_names, "Importance": importances})
-    fi = fi.sort_values("Importance", ascending=False)
-    st.dataframe(fi)
+    unique_labels = sorted(list(np.unique(np.concatenate([y_test_seq, y_pred]))))
+    target_names = [inv_regime_map.get(i, f"Unknown_{i}") for i in unique_labels]
 
-    fig2, ax2 = plt.subplots(figsize=(8, max(4, len(fi.head(25)) * 0.3)))
-    sns.barplot(data=fi.head(25), x="Importance", y="Feature", ax=ax2)
-    ax2.set_title("Top 25 Features")
+    st.subheader("Classification Report (Test Set)")
+    report = classification_report(y_test_seq, y_pred, labels=unique_labels, target_names=target_names, output_dict=True, zero_division=0)
+    st.dataframe(pd.DataFrame(report).transpose())
+
+    st.subheader("Confusion Matrix (Test Set)")
+    cm = confusion_matrix(y_test_seq, y_pred, labels=unique_labels)
+    fig2, ax2 = plt.subplots()
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=target_names, yticklabels=target_names, ax=ax2)
+    ax2.set_xlabel("Predicted")
+    ax2.set_ylabel("True")
     st.pyplot(fig2)
 
-    # ----- Save -----
-    os.makedirs(MODEL_FOLDER, exist_ok=True)
-    base_name = os.path.splitext(selected_file)[0]
-    model_path = os.path.join(MODEL_FOLDER, f"lgbm_regime5m__{base_name}.pkl")
-    joblib.dump(clf, model_path)
-
-    meta = {
-        "target": "Regime_5m",
-        "regime_map": {k: int(v) for k, v in regime_map.items()},
-        "features": feature_names,
-        "train_size": int(len(X_tr)),
-        "val_size": int(len(X_val)),
-        "test_size": int(len(X_test)),
-        "selected_file": selected_file,
-        "params": clf.get_params()
-    }
-    meta_path = os.path.join(MODEL_FOLDER, f"lgbm_regime5m__{base_name}.meta.json")
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2)
-
-    st.success(f"Model saved: {model_path}")
-    st.caption(f"Metadata saved: {meta_path}")
+    # --- Save Model, Scaler, and Metadata ---
+    if st.button("Save LSTM Model and Scaler"):
+        os.makedirs(MODEL_FOLDER, exist_ok=True)
+        
+        model_path = os.path.join(MODEL_FOLDER, "lstm_regime_model.keras")
+        model.save(model_path)
+        
+        scaler_path = os.path.join(MODEL_FOLDER, "scaler.joblib")
+        joblib.dump(scaler, scaler_path)
+        
+        meta = {
+            "model_type": "LSTM",
+            "target": "regime",
+            "regime_map": regime_map,
+            "features": feature_cols,
+            "time_steps": time_steps,
+            "training_file": selected_file,
+        }
+        meta_path = os.path.join(MODEL_FOLDER, "lstm_model_metadata.json")
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=4)
+            
+        st.success(f"Model saved to: `{model_path}`")
+        st.success(f"Scaler saved to: `{scaler_path}`")
+        st.success(f"Metadata saved to: `{meta_path}`")
