@@ -29,7 +29,7 @@ This page trains an LSTM network to predict the HMM-generated market regime for 
 
 # ----- 1. Load Data -----
 try:
-    labeled_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_hmm_labels.csv")]
+    labeled_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_labeled.csv")]
 except FileNotFoundError:
     st.error(f"Data folder '{DATA_FOLDER}' not found.")
     labeled_files = []

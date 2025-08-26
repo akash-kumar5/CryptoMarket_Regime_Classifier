@@ -2,9 +2,12 @@
     "model_type": "LSTM",
     "target": "regime",
     "regime_map": {
-        "Range": 0,
-        "Squeeze": 1,
-        "Trend": 2
+        "Choppy High-Vol": 0,
+        "Range": 1,
+        "Squeeze": 2,
+        "Strong Trend": 3,
+        "Volatility Spike": 4,
+        "Weak Trend": 5
     },
     "features": [
         "log_ret_1_15m",
@@ -45,5 +48,5 @@
         "wick_ratio_1h"
     ],
     "time_steps": 64,
-    "training_file": "BTCUSDT_merged_2023-05-01_2025-08-22_hmm_labels.csv"
+    "training_file": "BTCUSDT_merged_2023-05-01_2025-08-22_labeled.csv"
 }

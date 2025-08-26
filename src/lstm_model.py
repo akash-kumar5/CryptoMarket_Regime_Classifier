@@ -49,7 +49,7 @@ def build_lstm_model(input_shape, num_classes, lstm_units=64, dense_units=32, dr
         Dense(units=num_classes, activation='softmax')
     ])
     
-    model.compile(optimizer=Adam(learning_rate=0.0001),
+    model.compile(optimizer=Adam(learning_rate=0.001),
                   loss='categorical_crossentropy',
                   metrics=['accuracy'])
     
