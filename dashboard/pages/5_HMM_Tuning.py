@@ -38,8 +38,8 @@ else:
     
     # Select features for the HMM
     default_hmm_features = [
-        'log_ret_1_15m', 'bb_width_15m', 'atr_norm_15m', 'adx_15m',
-        'volume_zscore_50_15m', 'macd_hist_15m', 'rsi_15m'
+        'log_ret_1_5m', 'bb_width_5m', 'atr_norm_5m', 'adx5m',
+        'volume_zscore_50_5m', 'macd_hist_5m', 'rsi_5m'
     ]
     all_feature_cols = [col for col in df.columns if col not in ['timestamp'] and not col.startswith(('open_', 'high_', 'low_', 'close_', 'volume_'))]
     filtered_default_features = [f for f in default_hmm_features if f in all_feature_cols]
@@ -53,14 +53,14 @@ else:
     st.sidebar.subheader("Hyperparameter Search Grid")
     n_states_range = st.sidebar.select_slider(
         "Range of HMM States to test",
-        options=list(range(2, 8)),
-        value=(3, 5)
+        options=list(range(4, 20)),
+        value=(4, 6)
     )
     
     max_pca_val = len(hmm_features) if hmm_features else 1
     n_pca_range = st.sidebar.select_slider(
         "Range of PCA Components to test",
-        options=list(range(2, max_pca_val + 1)),
+        options=list(range(3, max_pca_val + 1)),
         value=(min(4, max_pca_val), min(8, max_pca_val))
     )
 

@@ -105,6 +105,19 @@ if st.button("Train LSTM Model", type="primary"):
         dropout_rate=dropout_rate
     )
     st.write(model.summary())
+    
+    from sklearn.utils import class_weight
+    
+    class_weights = class_weight.compute_class_weight(
+        'balanced',
+        classes=np.unique(y_train_seq),
+        y=y_train_seq
+    )
+    # Convert the array of weights into a dictionary that Keras expects
+    class_weight_dict = dict(enumerate(class_weights))
+    
+    st.write("**Applied Class Weights:**")
+    st.json({inv_regime_map[k]: f"{v:.2f}x" for k, v in class_weight_dict.items()})
 
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
@@ -118,7 +131,9 @@ if st.button("Train LSTM Model", type="primary"):
             batch_size=batch_size,
             validation_split=0.15, # Use last 15% of training data for validation
             callbacks=callbacks,
-            verbose=1
+            verbose=1,
+            class_weight=class_weight_dict,
+            shuffle=False
         )
         st.session_state['lstm_model'] = model
         st.session_state['lstm_history'] = history.history
@@ -182,4 +197,5 @@ if 'lstm_model' in st.session_state:
             
         st.success(f"Model saved to: `{model_path}`")
         st.success(f"Scaler saved to: `{scaler_path}`")
+
         st.success(f"Metadata saved to: `{meta_path}`")

@@ -44,8 +44,8 @@ else:
     
     # Feature selection for HMM
     default_hmm_features = [
-        'log_ret_1_15m', 'bb_width_15m', 'atr_norm_15m', 'adx_15m',
-        'volume_zscore_50_15m', 'macd_hist_15m', 'rsi_15m'
+        'log_ret_1_5m', 'bb_width_5m', 'atr_norm_5m', 'adx_5m',
+        'volume_zscore_50_5m', 'macd_hist_5m', 'rsi_5m'
     ]
     all_feature_cols = [col for col in df.columns if col not in ['timestamp'] and not col.startswith(('open_', 'high_', 'low_', 'close_', 'volume_'))]
     
@@ -102,7 +102,7 @@ else:
                 df_valid['state'] = hidden_states
                 
                 # 4. Interpret States
-                state_mapping = map_states_to_regimes(df_valid, hidden_states, main_tf='15m')
+                state_mapping = map_states_to_regimes(df_valid, hidden_states, main_tf='5m')
                 df_valid['regime'] = df_valid['state'].map(state_mapping)
                 
                 st.session_state['labeled_df'] = df_valid
@@ -119,7 +119,7 @@ else:
         st.json(state_mapping)
 
         st.subheader("Preview of Labeled Data")
-        st.dataframe(labeled_df[['timestamp', 'close_15m', 'state', 'regime']].tail(15))
+        st.dataframe(labeled_df[['timestamp', 'close_5m', 'state', 'regime']].tail(15))
         
 
         # --- Save Data ---

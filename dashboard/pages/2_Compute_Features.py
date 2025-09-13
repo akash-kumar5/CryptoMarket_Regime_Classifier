@@ -6,7 +6,7 @@ import pandas as pd
 
 # Add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from src.indicators import build_features
+from compute_features import build_features
 
 DATA_FOLDER = 'data/'
 
@@ -42,7 +42,7 @@ if merged_files:
         if st.button("Build Feature Set", type="primary"):
             with st.spinner("Computing features and applying leakage control..."):
                 # Call the new, robust feature engineering function
-                features_df = build_features(df, main_tf='15m', context_tfs=['5m', '1h'])
+                features_df = build_features(df, main_tf='5m', context_tfs=['1m', '15m'])
 
             if features_df is not None and not features_df.empty:
                 st.success("Feature set built successfully!")

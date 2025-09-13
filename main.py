@@ -3,7 +3,7 @@ import pandas as pd
 import joblib
 import plotly.graph_objects as go
 from src.data_fetcher import fetch_historical_data
-from src.indicators import compute_indicators
+from compute_features import compute_indicators
 
 # Load trained model
 clf = joblib.load('models/regime_classifier_model.pkl')
@@ -16,7 +16,7 @@ features = ['EMA20', 'EMA50', 'EMA200', 'RSI14', 'MACD_Hist', 'ATR14', 'BB_Width
 
 # Binance parameters
 symbol = 'BTCUSDT'
-interval = '5m'  # You can change this to '1m', '15m', etc.
+interval = '1m'  # You can change this to '1m', '15m', etc.
 poll_interval_sec = 30  # Refresh every 30 seconds
 
 def get_latest_data():

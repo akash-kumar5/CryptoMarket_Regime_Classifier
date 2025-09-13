@@ -26,7 +26,7 @@ It will test many different combinations of model architecture and training sett
 
 # --- File Selection ---
 try:
-    labeled_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_hmm_labels.csv")]
+    labeled_files = [f for f in os.listdir(DATA_FOLDER) if f.endswith("_labeled.csv")]
 except FileNotFoundError:
     st.error(f"Data folder '{DATA_FOLDER}' not found.")
     labeled_files = []

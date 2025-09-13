@@ -42,7 +42,7 @@ def train_hmm(features, n_states=3, n_iter=100, random_state=42):
     model.fit(features)
     return model
 
-def map_states_to_regimes(df, labels, main_tf='15m'):
+def map_states_to_regimes(df, labels, main_tf='5m'):
     """
     Interprets the HMM states by analyzing their characteristics.
     Handles 3, 4, or 6 states explicitly, falls back to generic otherwise.

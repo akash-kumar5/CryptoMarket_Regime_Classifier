@@ -9,6 +9,6 @@ st.markdown("""
 - **Fetch Data:** Download raw OHLCV data from Binance.
 - **Compute Features:** Compute Technical Indicators on existing CSV files.
 - **Regime Classifier:** Classify each tick into 4 class of regime using previous tick's data.
-- **Model Training:** Train model using Random Forest Algo
+- **Model Training:** Train model using LSTM Algo
 
 """)

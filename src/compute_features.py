@@ -3,19 +3,7 @@ import pandas as pd
 import numpy as np
 import talib
 
-def build_features(df, main_tf='15m', context_tfs=['5m', '1h']):
-    """
-    Builds a comprehensive feature set from the merged multi-timeframe data.
-    Crucially, it shifts context features to prevent lookahead bias.
-    
-    Args:
-        df (pd.DataFrame): The merged dataframe from data_cleaner.
-        main_tf (str): The primary timeframe for the model (e.g., '15m').
-        context_tfs (list): The other timeframes providing context.
-
-    Returns:
-        pd.DataFrame: DataFrame with all features and OHLCV data, ready for modeling.
-    """
+def build_features(df, main_tf='5m', context_tfs=['1m','15m']):
     
     # Make a copy to avoid modifying the original dataframe
     df_features = df.copy()
