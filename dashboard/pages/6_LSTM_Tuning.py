@@ -1,4 +1,4 @@
-# dashboard/pages/7_LSTM_Tuning.py
+# dashboard/pages/6_LSTM_Tuning.py
 import streamlit as st
 import sys
 import os

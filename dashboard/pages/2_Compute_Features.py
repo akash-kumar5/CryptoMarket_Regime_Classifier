@@ -6,7 +6,7 @@ import pandas as pd
 
 # Add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from compute_features import build_features
+from src.compute_features import build_features
 
 DATA_FOLDER = 'data/'
 

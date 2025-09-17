@@ -1,4 +1,4 @@
-# dashboard/pages/6_HMM_Tuning.py
+# dashboard/pages/5_HMM_Tuning.py
 import streamlit as st
 import sys
 import os
@@ -53,15 +53,15 @@ else:
     st.sidebar.subheader("Hyperparameter Search Grid")
     n_states_range = st.sidebar.select_slider(
         "Range of HMM States to test",
-        options=list(range(4, 20)),
+        options=list(range(4, 8)),
         value=(4, 6)
     )
     
     max_pca_val = len(hmm_features) if hmm_features else 1
     n_pca_range = st.sidebar.select_slider(
         "Range of PCA Components to test",
-        options=list(range(3, max_pca_val + 1)),
-        value=(min(4, max_pca_val), min(8, max_pca_val))
+        options=list(range(1, max_pca_val + 1)),
+        value=(min(1, max_pca_val), min(8, max_pca_val))
     )
 
     if st.sidebar.button("Run Hyperparameter Search", type="primary"):
