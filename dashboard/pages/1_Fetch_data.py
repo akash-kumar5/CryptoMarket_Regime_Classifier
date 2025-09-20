@@ -1,257 +1,144 @@
 # dashboard/pages/1_Fetch_data.py
-import os
-import sys
-import concurrent.futures
+import os, sys, json
 from datetime import datetime, timedelta
+import concurrent.futures
 import streamlit as st
 import pandas as pd
-import json
-import time
 
-# Add src path
-try:
-    sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
-    from src.data_fetcher import (
-        fetch_historical_klines,
-        fetch_agg_trades,
-        fetch_order_book_snapshot,
-        fetch_futures_funding_rate_history,
-        fetch_futures_open_interest,
-        aggtrades_to_5s_bars
-    )
-    from src.data_cleaner import save_data, merge_timeframes
-except ImportError as e:
-    st.error(f"Could not import custom modules: {e}. Ensure `src` exists and you're running streamlit from project root.")
-    # fallback stubs to avoid crashes during edit
-    def fetch_historical_klines(**kwargs): return pd.DataFrame()
-    def fetch_agg_trades(**kwargs): return pd.DataFrame()
-    def fetch_order_book_snapshot(**kwargs): return {}
-    def fetch_futures_funding_rate_history(**kwargs): return pd.DataFrame()
-    def fetch_futures_open_interest(**kwargs): return {}
-    def aggtrades_to_5s_bars(**kwargs): return pd.DataFrame()
-    def save_data(df, symbol, interval, dtype="klines", suffix=""): pass
-    def merge_timeframes(symbol, main_tf, context_tfs): return pd.DataFrame()
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+from src.data_fetcher import (
+    fetch_klines,
+    fetch_aggtrades_parallel,
+    fetch_orderbook_snapshot,
+    fetch_futures,
+    aggtrades_to_5s_bars
+)
+from src.data_cleaner import merge_timeframes
 
-DATA_FOLDER = "data/"
+DATA_FOLDER = "data"
 os.makedirs(DATA_FOLDER, exist_ok=True)
 
-st.set_page_config(page_title="Multi-Timeframe Data Fetcher", layout="wide")
-st.title("Binance Historical Data Fetcher - Multi Timeframe")
-st.markdown("""
-This tool fetches historical cryptocurrency data from Binance for multiple timeframes concurrently.
-You can fetch OHLCV klines and optionally trade-level aggTrades, a single order-book snapshot, and futures data (funding rate history / open interest).
-After fetching, the page can merge multiple klines timeframes into one dataset aligned to a chosen main timeframe.
-""")
+st.set_page_config(page_title="Binance Data Fetcher", layout="wide")
+st.title("Binance Historical Data Fetcher")
 
-# --- User Inputs ---
+# UI
 symbol = st.text_input("Symbol (e.g., BTCUSDT)", value="BTCUSDT").upper()
-
-col1, col2 = st.columns(2)
-with col1:
-    start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=90))
-with col2:
+c1, c2 = st.columns(2)
+with c1:
+    start_date = st.date_input("Start Date", value=datetime.now() - timedelta(days=2))
+with c2:
     end_date = st.date_input("End Date", value=datetime.now())
 
-available_timeframes = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d"]
-timeframes = st.multiselect(
-    "Select Timeframes to Fetch (klines)",
-    options=available_timeframes,
-    default=["1m", "5m"],
-    help="Select one or more timeframes to download KLINES (OHLCV)."
-)
+timeframes = st.multiselect("Timeframes (klines)", options=["1m","5m"], default=["1m","5m"])
 
-# Extra microstructure / derivatives options
-st.markdown("**Optional extra data** (will be fetched alongside klines if selected)")
-fetch_trades = st.checkbox("Fetch aggTrades (trade-level)", value=False, help="Backfill aggTrades (may be slow for long date ranges)")
-fetch_orderbook_snapshot = st.checkbox("Fetch current order-book snapshot (depth)", value=False, help="Fetch a single snapshot at the time of fetch")
-fetch_futures = st.checkbox("Fetch futures data (funding rate history & open interest)", value=False)
+TF_TO_MINUTES = {'1m':1,'5m':5,'15m':15,'30m':30,'1h':60}
+def dt_to_ms(dt): return int(datetime.combine(dt, datetime.min.time()).timestamp() * 1000)
+def make_fname(sym, kind, start, end, tf=None, ext='csv'):
+    parts = [sym, kind] + ([tf] if tf else []) + [f"{start.strftime('%Y%m%d')}_{end.strftime('%Y%m%d')}"]
+    return "_".join(parts) + f".{ext}"
 
-# main timeframe selection for merging (if multiple)
-main_tf = None
-if len(timeframes) > 1:
-    default_index = 0
-    if '5m' in timeframes:
-        default_index = timeframes.index('5m')
-    main_tf = st.selectbox(
-        "Select Main Timeframe for Merging",
-        options=timeframes,
-        index=default_index,
-        help="This timeframe will be the base index for the final merged dataset."
-    )
-
-# helper to make timestamps in ms
-def dt_to_ms(dt: datetime):
-    return int(datetime.combine(dt, datetime.min.time()).timestamp() * 1000)
-
-# ---------- Fetching worker ----------
-def fetch_and_save_klines(sym: str, interval: str, start_ms: int, end_ms: int):
-    df = fetch_historical_klines(symbol=sym, interval=interval, start_time=start_ms, end_time=end_ms)
-    if not df.empty:
-        fname = f"{sym}_klines_{interval}_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
-        path = os.path.join(DATA_FOLDER, fname)
-        df.to_csv(path, index=False)
-        # also call save_data if you have other processing
-        try:
-            save_data(df, sym, interval, dtype="klines", suffix=f"_{start_date.strftime('%Y%m%d')}")
-        except Exception:
-            pass
-        return ("klines", interval, path, len(df))
-    return ("klines", interval, None, 0)
-
-def fetch_and_save_aggtrades(sym: str, start_ms: int, end_ms: int, bucket_minutes: int = None):
-    # For large ranges, users should slice into smaller windows; here we attempt naive fetch
-    try:
-        df = fetch_agg_trades(symbol=sym, start_time=start_ms, end_time=end_ms)
-    except Exception as e:
-        st.warning(f"aggTrades fetch error for {sym}: {e}")
-        df = pd.DataFrame()
-    if not df.empty:
-        fname = f"{sym}_aggtrades_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
-        path = os.path.join(DATA_FOLDER, fname)
-        df.to_csv(path, index=False)
-        # optional aggregation to 5s bars for quick preview
-        preview_df = None
-        if bucket_minutes is None:
-            preview_df = aggtrades_to_5s_bars(df, bucket_ms=5000)
-            preview_name = f"{sym}_aggtrades_5s_preview_{start_date.strftime('%Y%m%d')}.csv"
-            preview_path = os.path.join(DATA_FOLDER, preview_name)
-            preview_df.to_csv(preview_path, index=False)
+# Utility: normalize klines DF to minimal OHLCV
+def normalize_ohlcv(df):
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+    if "timestamp" not in df.columns:
+        if "open_time" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["open_time"], utc=True, errors="coerce")
+        elif "open_time_ms" in df.columns:
+            df["timestamp"] = pd.to_datetime(df["open_time_ms"], unit="ms", utc=True, errors="coerce")
         else:
-            preview_df = aggtrades_to_5s_bars(df, bucket_ms=bucket_minutes*60*1000)
-        return ("aggtrades", None, path, len(df), preview_df)
-    return ("aggtrades", None, None, 0, None)
+            df.iloc[:,0] = pd.to_datetime(df.iloc[:,0], utc=True, errors="coerce")
+            df = df.rename(columns={df.columns[0]: "timestamp"})
+    keep = ["timestamp","open","high","low","close","volume"]
+    df = df[[c for c in keep if c in df.columns]].dropna(subset=["timestamp"])
+    for c in ["open","high","low","close","volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.sort_values("timestamp").reset_index(drop=True)
 
-def fetch_and_save_orderbook(sym: str, limit: int = 100):
-    try:
-        snapshot = fetch_order_book_snapshot(symbol=sym, limit=limit)
-    except Exception as e:
-        st.warning(f"Orderbook fetch error: {e}")
-        snapshot = {}
-    if snapshot:
-        fname = f"{sym}_depth_{limit}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.json"
-        path = os.path.join(DATA_FOLDER, fname)
-        with open(path, "w") as f:
-            json.dump(snapshot, f)
-        return ("depth", None, path, snapshot)
-    return ("depth", None, None, None)
-
-def fetch_and_save_futures(sym: str, start_ms: int, end_ms: int):
-    results = {}
-    try:
-        fr = fetch_futures_funding_rate_history(symbol=sym, start_time=start_ms, end_time=end_ms)
-        if not fr.empty:
-            fname = f"{sym}_funding_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
-            path = os.path.join(DATA_FOLDER, fname)
-            fr.to_csv(path, index=False)
-            results['funding'] = path
-    except Exception as e:
-        st.warning(f"Funding history fetch error: {e}")
-
-    try:
-        oi = fetch_futures_open_interest(symbol=sym)
-        results['open_interest_now'] = oi
-    except Exception as e:
-        st.warning(f"Open interest fetch error: {e}")
-
-    return ("futures", None, results, None)
-
-# ---------- Main action ----------
-if st.button("Fetch and Process Data", type="primary"):
-    if not timeframes and not (fetch_trades or fetch_orderbook_snapshot or fetch_futures):
-        st.warning("Select at least one fetch option: timeframes or microstructure/futures.")
-        st.stop()
-
-    start_ms = dt_to_ms(start_date)
-    end_ms = dt_to_ms(end_date)
-
+if st.button("Fetch Data"):
+    s_ms, e_ms = dt_to_ms(start_date), dt_to_ms(end_date)
+    jobs = [("klines", tf) for tf in timeframes] + [("aggtrades", None), ("depth", None), ("futures", None)]
     fetched = {}
-    with st.spinner("Fetching data... this may take a while for long ranges"):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            futures = {}
-            # klines
-            for tf in timeframes:
-                futures[executor.submit(fetch_and_save_klines, symbol, tf, start_ms, end_ms)] = ("klines", tf)
-            # trades
-            if fetch_trades:
-                futures[executor.submit(fetch_and_save_aggtrades, symbol, start_ms, end_ms)] = ("aggtrades", None)
-            # depth snapshot (single)
-            if fetch_orderbook_snapshot:
-                futures[executor.submit(fetch_and_save_orderbook, symbol, 100)] = ("depth", None)
-            # futures
-            if fetch_futures:
-                futures[executor.submit(fetch_and_save_futures, symbol, start_ms, end_ms)] = ("futures", None)
 
-            for fut in concurrent.futures.as_completed(futures):
+    with st.spinner("Fetching..."):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {}
+            for job, tf in jobs:
+                if job == "klines":
+                    fut = ex.submit(fetch_klines, symbol, tf, s_ms, e_ms)
+                elif job == "aggtrades":
+                    out_path = os.path.join(DATA_FOLDER, make_fname(symbol, "aggtrades", start_date, end_date))
+                    fut = ex.submit(fetch_aggtrades_parallel, symbol, s_ms, e_ms, out_path)
+                elif job == "depth":
+                    fut = ex.submit(fetch_orderbook_snapshot, symbol, 100)
+                elif job == "futures":
+                    fut = ex.submit(fetch_futures, symbol, s_ms, e_ms)
+                futs[fut] = (job, tf)
+
+            for fut in concurrent.futures.as_completed(futs):
+                job, tf = futs[fut]
                 try:
                     res = fut.result()
-                    key = futures[fut]
-                    fetched[key] = res
-                except Exception as e:
-                    st.warning(f"Worker failed: {e}")
+                except Exception as ex:
+                    st.warning(f"Error fetching {job} {tf}: {ex}")
+                    continue
 
-    st.success("Fetching finished. Results summary below.")
+                if job == "klines":
+                    df = normalize_ohlcv(res)
+                    if df is not None and not df.empty:
+                        path = os.path.join(DATA_FOLDER, make_fname(symbol, "klines", start_date, end_date, tf))
+                        df.to_csv(path, index=False)
+                        fetched[("klines", tf)] = df
+                elif job == "aggtrades":
+                    if isinstance(res, pd.DataFrame) and not res.empty:
+                        res.to_csv(os.path.join(DATA_FOLDER, make_fname(symbol, "aggtrades", start_date, end_date)), index=False)
+                        try:
+                            preview = aggtrades_to_5s_bars(res, bucket_ms=5000)
+                            preview.to_csv(os.path.join(DATA_FOLDER, make_fname(symbol, "aggtrades_5s", start_date, end_date)), index=False)
+                        except Exception:
+                            pass
+                elif job == "depth":
+                    if isinstance(res, dict) and res.get("bids") is not None:
+                        # Save bids/asks as CSV
+                        res["bids"].to_csv(os.path.join(DATA_FOLDER, f"{symbol}_depth_bids.csv"), index=False)
+                        res["asks"].to_csv(os.path.join(DATA_FOLDER, f"{symbol}_depth_asks.csv"), index=False)
 
-    # --- Display previews ---
-    for k, v in fetched.items():
-        kind, tf = k
-        if v is None:
-            st.write(f"{kind} : No data")
-            continue
-        if v[0] == "klines":
-            _, interval, path, nrows = v
-            if path:
-                with st.expander(f"Klines {interval} — {nrows} rows — {path}"):
-                    try:
-                        df_preview = pd.read_csv(path, parse_dates=['timestamp'])
-                    except Exception:
-                        df_preview = pd.read_csv(path)
-                    st.dataframe(df_preview.tail(10))
-        elif v[0] == "aggtrades":
-            _, _, path, nrows, preview_df = v
-            if path:
-                with st.expander(f"AggTrades — {nrows} rows — {path}"):
-                    st.write(f"Saved aggTrades to `{path}`")
-                    if preview_df is not None and not preview_df.empty:
-                        st.markdown("Preview (5s aggregated):")
-                        st.dataframe(preview_df.tail(10))
-        elif v[0] == "depth":
-            _, _, path, snapshot = v
-            if path:
-                with st.expander(f"Orderbook snapshot — {path}"):
-                    st.write(f"Saved depth snapshot JSON to `{path}`")
-                    st.write("Top 5 bids / asks (sample):")
-                    bids = snapshot.get("bids", [])[:5]
-                    asks = snapshot.get("asks", [])[:5]
-                    st.write({"bids": bids, "asks": asks})
-        elif v[0] == "futures":
-            _, _, results, _ = v
-            with st.expander("Futures results"):
-                if 'funding' in results:
-                    st.write(f"Funding saved to: {results['funding']}")
-                    try:
-                        df_f = pd.read_csv(results['funding'])
-                        st.dataframe(df_f.tail(10))
-                    except Exception:
-                        st.write(results['funding'])
-                if 'open_interest_now' in results:
-                    st.write("Current open interest (raw):")
-                    st.json(results['open_interest_now'])
+                        # Convert DataFrames to JSON-friendly format
+                        snap = {
+                            "lastUpdateId": res.get("lastUpdateId"),
+                            "fetched_at": str(res.get("fetched_at")),
+                            "bids": res["bids"][["price", "qty"]].astype(str).values.tolist(),
+                            "asks": res["asks"][["price", "qty"]].astype(str).values.tolist()
+                        }
 
-    # --- Merge logic ---
-    if len(timeframes) > 1 and main_tf:
-        context_tfs = [tf for tf in timeframes if tf != main_tf]
-        st.info(f"Merging data with '{main_tf}' as the main timeframe.")
-        with st.spinner("Merging timeframes..."):
-            merged_df = merge_timeframes(symbol, main_tf=main_tf, context_tfs=context_tfs)
+                        snap_path = os.path.join(DATA_FOLDER, f"{symbol}_depth_snapshot.json")
+                        with open(snap_path, "w") as f:
+                            json.dump(snap, f)
+                elif job == "futures":
+                    if isinstance(res, dict):
+                        if isinstance(res.get("funding"), pd.DataFrame) and not res["funding"].empty:
+                            res["funding"].to_csv(os.path.join(DATA_FOLDER, make_fname(symbol, "funding", start_date, end_date)), index=False)
+                        if res.get("open_interest_now"):
+                            with open(os.path.join(DATA_FOLDER, f"{symbol}_open_interest.json"), "w") as f:
+                                json.dump(res["open_interest_now"], f)
 
-        if merged_df is not None and not merged_df.empty:
-            merged_filename = f"{symbol}_merged_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv"
-            merged_path = os.path.join(DATA_FOLDER, merged_filename)
-            merged_df.to_csv(merged_path, index=False)
-            st.success(f"Merged data saved as `{merged_path}`")
-            with st.expander("Preview of merged data"):
-                st.dataframe(merged_df.tail(20))
-        else:
-            st.error("Failed to merge data. Ensure the main timeframe and at least one context timeframe were fetched successfully.")
-    else:
-        st.info("Skipping merge (either only one timeframe selected or main timeframe not set).")
+    # Merge only klines
+    selectable = [tf for tf in timeframes if tf in TF_TO_MINUTES]
+    if selectable:
+        main_tf = min(selectable, key=lambda t: TF_TO_MINUTES[t])
+        ctx = [t for t in selectable if t != main_tf]
+        klines_map = {tf: fetched[("klines", tf)] for tf in selectable if ("klines", tf) in fetched}
+        merged = merge_timeframes(symbol, main_tf=main_tf,
+                                  start_date=start_date.strftime("%Y%m%d"),
+                                  end_date=end_date.strftime("%Y%m%d"),
+                                  context_tfs=ctx,
+                                  klines_map=klines_map)
+        if merged is not None and not merged.empty:
+            out_name = make_fname(symbol, "combined_klines", start_date, end_date)
+            out_path = os.path.join(DATA_FOLDER, out_name)
+            merged.to_csv(out_path, index=False)
+            st.success(f"Merged klines saved: {out_path}")
+            with st.expander("Preview merged (tail)"):
+                st.dataframe(merged.tail(20))
