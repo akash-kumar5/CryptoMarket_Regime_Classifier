@@ -29,7 +29,7 @@ with c1:
 with c2:
     end_date = st.date_input("End Date", value=datetime.now())
 
-timeframes = st.multiselect("Timeframes (klines)", options=["1m","5m"], default=["1m","5m"])
+timeframes = st.multiselect("Timeframes (klines)", options=["1m","5m","15m"], default=["1m","5m"])
 
 TF_TO_MINUTES = {'1m':1,'5m':5,'15m':15,'30m':30,'1h':60}
 def dt_to_ms(dt): return int(datetime.combine(dt, datetime.min.time()).timestamp() * 1000)
