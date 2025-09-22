@@ -5,28 +5,153 @@ import talib
 from typing import Optional
 
 EPS = 1e-12
+import json
+
+def parse_datetime_series(s: pd.Series) -> pd.Series:
+    """Robustly parse mixed datetime formats and epoch numbers to tz-aware UTC datetimes."""
+    # Try straightforward parse first (no infer_datetime_format arg)
+    out = pd.to_datetime(s, utc=True, errors='coerce')
+
+    # If everything parsed, return
+    if out.notna().all():
+        return out
+
+    # Fallback: attempt cleaning (strip quotes) and numeric epoch detection
+    raw = s.astype(str).str.strip().str.replace('"', '')
+    is_digits = raw.str.match(r'^\d{10,16}$')  # seconds or ms-ish
+    if is_digits.any():
+        sample = raw[is_digits].iloc[0]
+        try:
+            if len(sample) >= 13:
+                # epoch ms
+                out.loc[is_digits] = pd.to_datetime(raw[is_digits].astype(np.int64), unit='ms', utc=True, errors='coerce')
+            else:
+                # epoch seconds
+                out.loc[is_digits] = pd.to_datetime(raw[is_digits].astype(np.int64), unit='s', utc=True, errors='coerce')
+        except Exception:
+            pass
+
+    # Final attempt: per-item parse (slower but robust)
+    mask = out.isna()
+    if mask.any():
+        out.loc[mask] = raw[mask].apply(lambda x: pd.to_datetime(x, utc=True, errors='coerce'))
+
+    return out
+
+
 
 # -------------------------
 # Utilities
 # -------------------------
+def parse_depth_snapshot_json(path: str, ts_field_candidates=('fetched_at','fetchedAt','timestamp','time')):
+    """
+    Load depth snapshot JSON/JSONL, rename parsed timestamp column to 'timestamp' (UTC),
+    and ensure bids/asks are lists of [float_price, float_qty].
+    """
+    # load as json lines or single json
+    try:
+        df = pd.read_json(path, lines=True)
+    except ValueError:
+        with open(path, 'r') as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            payload = [payload]
+        df = pd.DataFrame(payload)
+
+    if df.empty:
+        return df
+
+    # find timestamp column
+    ts_col = None
+    for c in ts_field_candidates:
+        if c in df.columns:
+            ts_col = c
+            break
+    if ts_col is None:
+        # fallback heuristics
+        poss = [c for c in df.columns if 'time' in c.lower() or 'fetch' in c.lower()]
+        ts_col = poss[0] if poss else None
+    if ts_col is None:
+        raise ValueError("No timestamp-like field in depth snapshot")
+
+    # parse timestamp robustly
+    df['timestamp'] = parse_datetime_series(df[ts_col])
+
+    # robust normalizer for bids/asks
+    def norm_side(cell):
+        # handle None / NaN
+        if cell is None:
+            return []
+        # catch pandas NA / numpy NaN scalars
+        if isinstance(cell, (float,)) and pd.isna(cell):
+            return []
+        # if it's a numpy array, convert to list
+        if isinstance(cell, (np.ndarray, tuple)):
+            parsed = list(cell)
+        elif isinstance(cell, list):
+            parsed = cell
+        elif isinstance(cell, str):
+            # try parsing JSON string like '[["115349.39","4.81254"], ...]'
+            try:
+                parsed = json.loads(cell)
+            except Exception:
+                # sometimes strings can be like "[(...)]" or other; fail gracefully
+                return []
+        else:
+            # unknown type — try to coerce to list if iterable
+            try:
+                parsed = list(cell)
+            except Exception:
+                return []
+
+        out = []
+        for item in parsed:
+            # item should be a 2-item sequence: [price, qty]
+            try:
+                # guard against nested arrays represented as numpy types or strings
+                p = float(item[0])
+                q = float(item[1])
+                out.append([p, q])
+            except Exception:
+                # skip malformed entries silently
+                continue
+        return out
+
+    if 'bids' in df.columns:
+        df['bids'] = df['bids'].apply(norm_side)
+    if 'asks' in df.columns:
+        df['asks'] = df['asks'].apply(norm_side)
+
+    # keep useful cols
+    keep = ['timestamp']
+    if 'lastUpdateId' in df.columns:
+        keep.append('lastUpdateId')
+    if 'bids' in df.columns:
+        keep.append('bids')
+    if 'asks' in df.columns:
+        keep.append('asks')
+    return df[keep]
+
+
 def _ensure_dt(df: pd.DataFrame, ts_col: str = 'timestamp') -> pd.DataFrame:
+    """
+    Ensure df[ts_col] exists and is timezone-aware UTC datetime64[ns, UTC].
+    If column missing, returns df unchanged.
+    """
     df = df.copy()
-    if ts_col in df.columns and not np.issubdtype(df[ts_col].dtype, np.datetime64):
-        df[ts_col] = pd.to_datetime(df[ts_col])
+    if ts_col not in df.columns:
+        return df
+    # Use the robust parser you defined above
+    df[ts_col] = parse_datetime_series(df[ts_col])
     return df
 
 def safe_talib(func, *args, **kwargs):
-    """
-    Call a talib function defensively and return a numpy array
-    of NaNs on failure (length inferred from first arg).
-    """
     try:
         return func(*args, **kwargs)
     except Exception:
-        if len(args) > 0:
-            n = len(args[0])
-            return np.full(n, np.nan)
-        return np.array([])
+        n= len(args[0]) if len(args) > 0 else 0
+        nan_arr = np.full(n, np.nan)
+        return (nan_arr, nan_arr,nan_arr)
 
 def robust_zscore(s: pd.Series, window: int = 50) -> pd.Series:
     med = s.rolling(window=window, min_periods=1).median()
@@ -39,59 +164,197 @@ def robust_zscore(s: pd.Series, window: int = 50) -> pd.Series:
 # -------------------------
 # Aggregation helpers
 # -------------------------
+def load_and_normalize_funding(path: str):
+    try:
+        if path.endswith('.json') or path.endswith('.jsonl'):
+            df = pd.read_json(path, lines=True)
+        else:
+            df = pd.read_csv(path)
+    except Exception:
+        # try json-lines manual
+        try:
+            with open(path, 'r') as f:
+                lines = f.read().strip().splitlines()
+            parsed = [json.loads(l) for l in lines if l.strip()]
+            df = pd.DataFrame(parsed)
+        except Exception:
+            return None
+
+    if df is None or df.empty:
+        return None
+
+    # Try to find a timestamp column
+    ts_candidates = ['timestamp', 'fundingTime', 'funding_time', 'time', 'fetched_at']
+    ts_col = next((c for c in ts_candidates if c in df.columns), None)
+    if ts_col is None:
+        # try heuristic
+        possible = [c for c in df.columns if 'time' in c.lower() or 'date' in c.lower()]
+        ts_col = possible[0] if possible else None
+
+    # create timestamp column (may be NaT if unable to parse)
+    if ts_col is not None:
+        df['timestamp'] = parse_datetime_series(df[ts_col])
+    else:
+        # create timestamp column of NaT so merges won't break, but caller can see it's empty
+        df['timestamp'] = pd.NaT
+
+    # find funding rate column
+    fr_col = None
+    if 'fundingRate' in df.columns:
+        fr_col = 'fundingRate'
+    elif 'funding_rate' in df.columns:
+        fr_col = 'funding_rate'
+        df = df.rename(columns={fr_col: 'fundingRate'})
+        fr_col = 'fundingRate'
+    else:
+        cand = next((c for c in df.columns if 'fund' in c.lower() and 'rate' in c.lower()), None)
+        if cand:
+            df = df.rename(columns={cand: 'fundingRate'})
+            fr_col = 'fundingRate'
+
+    if fr_col is not None:
+        df['fundingRate'] = pd.to_numeric(df['fundingRate'], errors='coerce')
+    else:
+        df['fundingRate'] = np.nan
+
+    return df[['timestamp','fundingRate']].sort_values('timestamp').reset_index(drop=True)
+
+def load_and_normalize_oi(path: str):
+    """
+    Robust loader for open interest files.
+    Handles:
+      - JSON lines or single JSON objects with fields like {"time": 1758482274421, "openInterest": "88794.463"}
+      - CSV with time/open_interest columns
+    Returns DataFrame with ['timestamp' (datetime64[ns, UTC]), 'openInterest' (float)] or None.
+    """
+    try:
+        if path.endswith('.json') or path.endswith('.jsonl') or path.endswith('.ndjson'):
+            df = pd.read_json(path, lines=True)
+        else:
+            df = pd.read_csv(path)
+    except Exception:
+        # try manual json load
+        try:
+            with open(path, 'r') as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                payload = [payload]
+            df = pd.DataFrame(payload)
+        except Exception:
+            return None
+
+    if df is None or df.empty:
+        return None
+
+    # Normalize time -> timestamp
+    if 'time' in df.columns:
+        # time is epoch ms (as in your example)
+        # coerce to numeric then to datetime
+        try:
+            df['timestamp'] = pd.to_datetime(pd.to_numeric(df['time'], errors='coerce'), unit='ms', utc=True)
+        except Exception:
+            # fallback to robust parser
+            df['timestamp'] = parse_datetime_series(df['time'].astype(str))
+    else:
+        # fallback to other possible time cols or robust parsing
+        tcol = next((c for c in df.columns if 'time' in c.lower() or 'timestamp' in c.lower()), None)
+        if tcol:
+            df['timestamp'] = parse_datetime_series(df[tcol])
+        else:
+            df['timestamp'] = pd.NaT
+
+    # Normalize openInterest -> numeric
+    if 'openInterest' in df.columns:
+        df['openInterest'] = pd.to_numeric(df['openInterest'], errors='coerce')
+    elif 'open_interest' in df.columns:
+        df['openInterest'] = pd.to_numeric(df['open_interest'], errors='coerce')
+    else:
+        # try to guess a column name containing both tokens
+        cand = next((c for c in df.columns if 'open' in c.lower() and 'interest' in c.lower()), None)
+        if cand:
+            df['openInterest'] = pd.to_numeric(df[cand], errors='coerce')
+        else:
+            df['openInterest'] = np.nan
+
+    # keep only useful cols and sort
+    out = df[['timestamp','openInterest']].copy()
+    out = out.sort_values('timestamp').reset_index(drop=True)
+    return out
+
 def aggregate_aggtrades_to_5m(
     agg_df: pd.DataFrame,
     ts_col: str = 'timestamp',
-    price_col: str = 'price',
-    qty_candidates = ('qty', 'q', 'quantity', 'volume'),
+    price_candidates=('price','p','P','Price'),
+    qty_candidates=('qty','q','quantity','volume','Q'),
     taker_buy_vol_col: str = 'taker_buy_vol',
-    resample_rule: str = '5T'
+    resample_rule: str = '5min'
 ) -> pd.DataFrame:
-    """
-    Aggregate raw aggtrades (tick or short-interval) to 5m microstructure features.
-    Returns DataFrame with timestamp (period start) and columns:
-      trade_count_5m, volume_5m_from_agg, vwap_all_5m,
-      taker_buy_vol_5m, taker_buy_ratio_5m, trade_imbalance_5m, vwap_skew_5m, max_tick_ret_5m
-    """
+
     if agg_df is None or agg_df.empty:
-        return pd.DataFrame(columns=['timestamp'])
+        return pd.DataFrame(columns=[ts_col])
 
     df = agg_df.copy()
-    df = _ensure_dt(df, ts_col)
-    df = df.sort_values(ts_col)
 
-    # pick qty col
-    qty_col = None
-    for c in qty_candidates:
-        if c in df.columns:
-            qty_col = c
-            break
-    if qty_col is None:
-        raise ValueError(f"aggregate_aggtrades_to_5m: no qty column found. Tried {qty_candidates}")
+    # normalize timestamp if present
+    if ts_col in df.columns:
+        df[ts_col] = parse_datetime_series(df[ts_col])
+    else:
+        # try common alternates
+        for alt in ('T','time','timestamp_ms','ts'):
+            if alt in df.columns:
+                df[ts_col] = parse_datetime_series(df[alt])
+                break
 
-    # ensure numeric
-    df[price_col] = df[price_col].astype(float)
-    df[qty_col] = df[qty_col].astype(float)
-    if taker_buy_vol_col in df.columns:
-        df[taker_buy_vol_col] = df[taker_buy_vol_col].astype(float)
+    # detect whether file is per-trade (price+qty) or pre-aggregated OHLCV
+    price_col = next((c for c in price_candidates if c in df.columns), None)
+    qty_col = next((c for c in qty_candidates if c in df.columns), None)
+    has_ohlcv = all(c in df.columns for c in ('open', 'high', 'low', 'close', 'volume'))
 
-    df = df.set_index(ts_col)
+    # If neither price/qty nor OHLCV present -> fail with helpful message
+    if (price_col is None or qty_col is None) and not has_ohlcv:
+        raise KeyError(
+            "aggregate_aggtrades_to_5m: couldn't find price/qty or ohlcv columns. "
+            f"Found columns: {list(df.columns)}. Expected price in {price_candidates} or ohlcv columns."
+        )
+
+    # If OHLCV provided, treat each row as a micro-bucket tick and resample
+    if has_ohlcv and (price_col is None or qty_col is None):
+        # use 'close' as representative price and 'volume' as qty
+        df = df.rename(columns={'close': 'tick_price', 'volume': 'tick_qty'}, errors='ignore')
+        price_col = 'tick_price'
+        qty_col = 'tick_qty'
+        df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
+        df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce')
+        # ensure taker column numeric if present
+        if taker_buy_vol_col in df.columns:
+            df[taker_buy_vol_col] = pd.to_numeric(df[taker_buy_vol_col], errors='coerce')
+    else:
+        # per-trade case: coerce numeric types
+        df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
+        df[qty_col] = pd.to_numeric(df[qty_col], errors='coerce')
+        if taker_buy_vol_col in df.columns:
+            df[taker_buy_vol_col] = pd.to_numeric(df[taker_buy_vol_col], errors='coerce')
+
+    # set index and resample
+    if ts_col not in df.columns:
+        # if still no timestamp, try to proceed but warn
+        raise KeyError("aggregate_aggtrades_to_5m: no timestamp column found after attempts.")
+    df = df.set_index(ts_col).sort_index()
 
     def agg_func(g: pd.DataFrame):
         out = {}
+        total_vol = float(g[qty_col].sum()) if qty_col in g.columns else 0.0
         out['trade_count_5m'] = int(g.shape[0])
-        out['volume_5m_from_agg'] = g[qty_col].sum()
-        total_vol = out['volume_5m_from_agg'] + EPS
-        out['vwap_all_5m'] = (g[price_col] * g[qty_col]).sum() / total_vol
+        out['volume_5m_from_agg'] = total_vol
+        out['vwap_all_5m'] = float((g[price_col] * g[qty_col]).sum() / (total_vol + EPS)) if total_vol > 0 else np.nan
 
-        # taker fields if present
         if taker_buy_vol_col in g.columns:
-            out['taker_buy_vol_5m'] = g[taker_buy_vol_col].sum()
-            out['taker_buy_ratio_5m'] = out['taker_buy_vol_5m'] / total_vol
-            out['trade_imbalance_5m'] = (2.0 * out['taker_buy_vol_5m'] - out['volume_5m_from_agg']) / total_vol
-            taker_sum = g[taker_buy_vol_col].sum()
-            if taker_sum > 0:
-                out['vwap_taker_5m'] = (g[price_col] * g[taker_buy_vol_col]).sum() / (taker_sum + EPS)
+            tb = float(g[taker_buy_vol_col].sum())
+            out['taker_buy_vol_5m'] = tb
+            out['taker_buy_ratio_5m'] = tb / (total_vol + EPS) if total_vol > 0 else np.nan
+            out['trade_imbalance_5m'] = (2.0*tb - total_vol) / (total_vol + EPS) if total_vol > 0 else np.nan
+            if tb > 0:
+                out['vwap_taker_5m'] = float((g[price_col] * g[taker_buy_vol_col]).sum() / (tb + EPS))
                 out['vwap_skew_5m'] = out['vwap_taker_5m'] - out['vwap_all_5m']
             else:
                 out['vwap_taker_5m'] = np.nan
@@ -102,39 +365,34 @@ def aggregate_aggtrades_to_5m(
             out['trade_imbalance_5m'] = np.nan
             out['vwap_skew_5m'] = np.nan
 
-        # max tick return inside bucket
+        # max tick return inside bucket (use per-row price sequence)
         if len(g) > 1:
-            prices = g[price_col]
-            logrets = np.log(prices / prices.shift(1) + EPS).dropna()
-            out['max_tick_ret_5m'] = float(logrets.abs().max()) if not logrets.empty else 0.0
+            prices = g[price_col].dropna()
+            if len(prices) > 1:
+                lr = np.log(prices / prices.shift(1) + EPS).dropna()
+                out['max_tick_ret_5m'] = float(lr.abs().max()) if not lr.empty else 0.0
+            else:
+                out['max_tick_ret_5m'] = 0.0
         else:
             out['max_tick_ret_5m'] = 0.0
-
         return pd.Series(out)
 
     agg5 = df.resample(resample_rule).apply(lambda g: agg_func(g))
-    agg5 = agg5.reset_index().rename(columns={agg5.index.name: 'timestamp'}) if 'timestamp' not in agg5.columns else agg5.reset_index()
-    # ensure timestamp column exists
-    if agg5.index.name is not None:
-        agg5 = agg5.reset_index().rename(columns={agg5.index.name: 'timestamp'})
-    agg5 = agg5.reset_index(drop=True)
-    # keep timestamp as column
-    if 'timestamp' not in agg5.columns and agg5.index.name == 'timestamp':
-        agg5['timestamp'] = agg5.index
+    agg5 = agg5.reset_index()
+    # normalize timestamp tz
+    agg5[ts_col] = parse_datetime_series(agg5[ts_col])
     return agg5
+
+
 
 def aggregate_depth_snapshot_to_5m(
     depth_snap_df: pd.DataFrame,
     ts_col: str = 'timestamp',
     bids_col: str = 'bids',
     asks_col: str = 'asks',
-    resample_rule: str = '5T',
+    resample_rule: str = '5min',
     band_pcts = (0.001, 0.005)
 ) -> pd.DataFrame:
-    """
-    Convert depth snapshot rows (each row contains bids/asks lists of [price,qty])
-    to per-5m snapshot features: spread_pct, bid_depth_10bps, ask_depth_10bps, pressure_index_10bps, etc.
-    """
     if depth_snap_df is None or depth_snap_df.empty:
         return pd.DataFrame(columns=['timestamp'])
 
@@ -242,44 +500,72 @@ def merge_all_sources_to_5m(
     funding_df: Optional[pd.DataFrame] = None,
     oi_df: Optional[pd.DataFrame] = None,
     ts_col: str = 'timestamp',
-    resample_rule: str = '5T'
+    resample_rule: str = '5min'
 ) -> pd.DataFrame:
-    """
-    Merge kline (5m) with aggregated aggtrades, depth snapshot features, funding, and OI.
-    Returns a kline-aligned DataFrame containing original kline columns plus:
-      trade_count_5m, volume_5m_from_agg, taker_buy_ratio_5m, trade_imbalance_5m, vwap_skew_5m, max_tick_ret_5m,
-      spread_pct, bid_depth_10bps, ask_depth_10bps, pressure_index_10bps, ... (for bands),
-      fundingRate, fundingRate_d_1h, openInterest, d_oi_5m
-    """
-    k = _ensure_dt(kline_df, ts_col).sort_values(ts_col).reset_index(drop=True)
 
-    # aggtrades
-    if agg_df is not None and not agg_df.empty:
-        agg5 = aggregate_aggtrades_to_5m(agg_df, ts_col=ts_col, resample_rule=resample_rule)
-        # merge_asof: align latest agg bucket <= kline timestamp
-        k = pd.merge_asof(k.sort_values(ts_col), agg5.sort_values('timestamp'),
-                          left_on=ts_col, right_on='timestamp', direction='backward', tolerance=pd.Timedelta(resample_rule))
-        # drop the extra timestamp column from agg5 if present
-        if 'timestamp_y' in k.columns:
-            k = k.drop(columns=['timestamp_y'])
-        # rename timestamp_x -> timestamp if happened
-        if 'timestamp_x' in k.columns:
-            k = k.rename(columns={'timestamp_x':'timestamp'})
+    # normalize kline
+    k = _ensure_dt(kline_df, ts_col)
+    if ts_col not in k.columns:
+        raise ValueError(f"kline missing timestamp column '{ts_col}'")
+    k = k.sort_values(ts_col).reset_index(drop=True)
 
-    # depth snapshots
-    if depth_snapshots_df is not None and not depth_snapshots_df.empty:
-        snap5 = aggregate_depth_snapshot_to_5m(depth_snapshots_df, ts_col=ts_col, resample_rule=resample_rule)
-        k = pd.merge_asof(k.sort_values(ts_col), snap5.sort_values(ts_col),
-                          left_on=ts_col, right_on=ts_col, direction='backward', tolerance=pd.Timedelta(resample_rule))
+    # helper to normalize optional dfs
+    def _norm(df):
+        if df is None:
+            return None
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        if ts_col in df.columns:
+            df = df.copy()
+            df[ts_col] = parse_datetime_series(df[ts_col])
+            df = df.sort_values(ts_col).reset_index(drop=True)
+            return df
+        return None
 
-    # funding & oi
-    k = merge_funding_and_oi_to_5m(k, funding_df=funding_df, oi_df=oi_df, ts_col=ts_col)
+    agg_in = _norm(agg_df)
+    depth_in = _norm(depth_snapshots_df)
+    fund_in = _norm(funding_df)
+    oi_in = _norm(oi_df)
 
-    # housekeeping: fill aggregated numeric NaNs with 0 for safety (you can change this policy)
+    # aggtrades merge (only if agg_in has timestamp)
+    if agg_in is not None:
+        agg5 = aggregate_aggtrades_to_5m(agg_in, ts_col=ts_col, resample_rule=resample_rule)
+        if ts_col in agg5.columns:
+            agg5[ts_col] = parse_datetime_series(agg5[ts_col])
+            agg5 = agg5.sort_values(ts_col).reset_index(drop=True)
+            k = pd.merge_asof(k, agg5, left_on=ts_col, right_on=ts_col, direction='backward', tolerance=pd.Timedelta(resample_rule))
+        else:
+            # skip agg merge if agg5 lacks timestamp
+            pass
+
+    # depth snapshot merge
+    if depth_in is not None and 'timestamp' in depth_in.columns:
+        snap5 = aggregate_depth_snapshot_to_5m(depth_in, ts_col=ts_col, resample_rule=resample_rule)
+        if 'timestamp' in snap5.columns:
+            snap5['timestamp'] = parse_datetime_series(snap5['timestamp'])
+            snap5 = snap5.sort_values('timestamp').reset_index(drop=True)
+            k = pd.merge_asof(k, snap5, left_on=ts_col, right_on='timestamp', direction='backward', tolerance=pd.Timedelta(resample_rule))
+
+    # funding & oi merges
+    if fund_in is not None and 'timestamp' in fund_in.columns:
+        fund_in = fund_in.sort_values('timestamp').reset_index(drop=True)
+        k = pd.merge_asof(k, fund_in, left_on=ts_col, right_on='timestamp', direction='backward')
+        # safe fill
+        k['fundingRate'] = k.get('fundingRate', pd.Series(dtype=float)).fillna(0.0)
+        k['fundingRate_d_1h'] = k['fundingRate'].diff(periods=12).fillna(0.0)
+
+    if oi_in is not None and 'timestamp' in oi_in.columns:
+        oi_in = oi_in.sort_values('timestamp').reset_index(drop=True)
+        k = pd.merge_asof(k, oi_in, left_on=ts_col, right_on='timestamp', direction='backward')
+        k['openInterest'] = k.get('openInterest', pd.Series(dtype=float)).fillna(method='ffill').fillna(0.0)
+        k['d_oi_5m'] = k['openInterest'].diff(periods=1).fillna(0.0)
+
+    # final fill for aggregated numeric columns
     agg_cols = [c for c in k.columns if c not in ['open_5m','high_5m','low_5m','close_5m','volume_5m','timestamp'] and pd.api.types.is_numeric_dtype(k[c])]
     k[agg_cols] = k[agg_cols].fillna(0.0)
 
     return k
+
 
 # -------------------------
 # Feature computation (OHLCV indicators)
@@ -291,13 +577,6 @@ def build_features(
     use_robust_volume_z: bool = False,
     dropna: bool = True
 ) -> pd.DataFrame:
-    """
-    Compute OHLCV-derived features for main_tf and context_tfs in df.
-    Expects df to already contain columns like close_5m, high_5m, low_5m, open_5m, volume_5m, and similar for context tfs.
-    Shifts context features by 1 bar to prevent lookahead bias.
-
-    Returns feature DataFrame (index reset).
-    """
     if context_tfs is None:
         context_tfs = ['15m']
 

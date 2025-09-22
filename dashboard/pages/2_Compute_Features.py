@@ -8,7 +8,7 @@ import pandas as pd
 
 # Add src path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from src.compute_features import build_features, merge_all_sources_to_5m
+from src.compute_features import build_features, merge_all_sources_to_5m, load_and_normalize_funding, parse_datetime_series
 
 DATA_FOLDER = 'data'
 
@@ -35,7 +35,7 @@ def find_merged_files(data_folder):
 def load_kline(file_path):
     df = pd.read_csv(file_path, parse_dates=['timestamp'])
     # ensure timestamp timezone-aware if present as string with +00:00 etc.
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, errors ='coerce')
     return df
 
 def guess_date_string_from_df(df):
@@ -153,6 +153,7 @@ if selected_path:
         funding_path = st.text_input("funding file path", value=found.get('funding') or "")
 
     # Convert empty strings to None
+    
     agg_path = agg_path.strip() or None
     depth_snap_path = depth_snap_path.strip() or None
     depth_asks_path = depth_asks_path.strip() or None
@@ -176,11 +177,18 @@ if selected_path:
             depth_snap_df = None
             if depth_snap_path:
                 try:
-                    depth_snap_df = safe_load_json_lines(depth_snap_path)
-                    st.write(f"Loaded depth_snapshot: {os.path.basename(depth_snap_path)} ({len(depth_snap_df)} rows)")
+                    # parse into the standardized snapshot format (timestamp, bids, asks)
+                    from src.compute_features import parse_depth_snapshot_json
+                    depth_snap_df = parse_depth_snapshot_json(depth_snap_path)
+                    if depth_snap_df is None or depth_snap_df.empty:
+                        st.warning(f"Depth snapshot loaded but empty: {os.path.basename(depth_snap_path)}")
+                        depth_snap_df = None
+                    else:
+                        st.write(f"Loaded depth_snapshot: {os.path.basename(depth_snap_path)} ({len(depth_snap_df)} rows)")
                 except Exception as e:
                     st.error(f"Failed to load depth_snapshot: {e}")
                     depth_snap_df = None
+
             else:
                 # if individual ask/bid CSVs are provided, attempt a basic join into a snapshot format
                 if depth_asks_path and depth_bids_path:
@@ -199,20 +207,18 @@ if selected_path:
             funding_df = None
             if funding_path:
                 try:
-                    if funding_path.endswith('.json'):
-                        funding_df = safe_load_json_lines(funding_path)
+                    # Use the robust loader that handles JSON/CSV and mixed timestamp formats
+                    funding_df = load_and_normalize_funding(funding_path)
+                    if funding_df is None or funding_df.empty:
+                        st.warning(f"Funding file loaded but empty or unparseable: {os.path.basename(funding_path)}")
+                        funding_df = None
                     else:
-                        funding_df = safe_load_csv(funding_path)
-                    if 'timestamp' in funding_df.columns or 'fundingTime' in funding_df.columns:
-                        # normalize timestamp column name to 'timestamp' expected by merge function
-                        if 'fundingTime' in funding_df.columns:
-                            funding_df = funding_df.rename(columns={'fundingTime':'timestamp'})
-                        if 'fundingRate' not in funding_df.columns and 'funding_rate' in funding_df.columns:
-                            funding_df = funding_df.rename(columns={'funding_rate':'fundingRate'})
-                        funding_df['timestamp'] = pd.to_datetime(funding_df['timestamp'])
-                    st.write(f"Loaded funding data: {os.path.basename(funding_path)} ({len(funding_df)} rows)")
+                        # load_and_normalize_funding ensures a 'timestamp' (tz-aware or NaT) and numeric fundingRate
+                        # but normalize to UTC explicitly for merging safety (this is fast)
+                        funding_df['timestamp'] = parse_datetime_series(funding_df['timestamp'])
+                        st.write(f"Loaded funding data: {os.path.basename(funding_path)} ({len(funding_df)} rows)")
                 except Exception as e:
-                    st.error(f"Failed to load funding file: {e}")
+                    st.error(f"Failed to load funding file (robust loader): {e}")
                     funding_df = None
 
             # Load open interest
@@ -245,7 +251,7 @@ if selected_path:
                     funding_df=funding_df,
                     oi_df=oi_df,
                     ts_col='timestamp',
-                    resample_rule='5T'
+                    resample_rule='5min'
                 )
             except Exception as e:
                 st.error(f"Failed while merging sources: {e}")
