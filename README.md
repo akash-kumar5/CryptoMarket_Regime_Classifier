@@ -1,79 +1,92 @@
 CryptoMarket Regime Classifier
+Adaptive Market Intelligence for Crypto Strategies
 ==============================
 
-Market regimes define the context in which trading strategies succeed or fail. A strategy that thrives in a strong trend will collapse in a choppy high-volatility market.This project builds a machine learning pipeline to **classify crypto market regimes** using **multi-timeframe data, Hidden Markov Models (HMM), and LSTMs**, making it easier to design adaptive strategies, position sizing, and risk management.
+Trading strategies don’t exist in a vacuum — they succeed or fail depending on the market regime they operate in. A breakout strategy that crushes in a trending market will bleed in a choppy one.
 
-Features
+CryptoMarket Regime Classifier is a complete machine learning pipeline that identifies and predicts market regimes in crypto markets using multi-timeframe data, technical features, Hidden Markov Models (HMM), and LSTMs.
+
+It’s designed as a foundational intelligence layer for strategy selection, position sizing, and risk management — and will power the regime-awareness module in Dazai[].
+
+Pipeline Overview
 --------
 
-*   **Multi-timeframe data (5m, 15m, 1h)** from Binance API.
-    
-*   **Feature engineering** with technical indicators across timeframes.
-    
-*   **Hidden Markov Models (HMM)** for unsupervised regime labeling.
-    
-*   **6 distinct regimes** discovered:
-    
-    1.  Choppy High-Volatility
-        
-    2.  Strong Trend
-        
-    3.  Volatility Spike
-        
-    4.  Weak Trend
-        
-    5.  Range
-        
-    6.  Squeeze
-        
-*   **LSTM classifier** trained on HMM labels for regime prediction.
-    
-*   **Evaluation metrics**: Precision, Recall, F1 Score, Confusion Matrix.
-    
-*   **Plug-and-play** saved models + scalers for use in downstream trading systems.
+From raw data to deployable model:
+
+1. Data Fetching – Periodically pulls OHLCV data (5m, 15m, 1h) from Binance.
+
+2. Feature Engineering – Computes momentum, volatility, and trend indicators across timeframes.
+
+3. Unsupervised Labeling (HMM) – Uses PCA-reduced feature space to discover market regimes.
+
+4. Supervised Prediction (LSTM) – Trains a sequence model on HMM labels to predict regimes.
+
+5. Model Export – Saves trained model & scalers for integration with live systems.
+
+6. Live Classification – Periodically classifies the current regime with plans for probabilistic outputs.
+
+
+## Key Features
+- Multi-timeframe data (5m, 15m, 1h) from Binance
+- Feature engineering with technical indicators (momentum, volatility, trend)
+- Hidden Markov Models (HMM) for unsupervised regime discovery
+- LSTM classifier trained on HMM-labeled sequences
+- 6 distinct regimes identified:
+    -- Choppy High-Volatility
+    -- Strong Trend
+    -- Volatility Spike
+    -- Weak Trend
+    -- Range
+    -- Squeeze
+- Plug-and-play model + scaler for downstream usage
+- Evaluation metrics: Precision, Recall, F1 Score, Confusion Matrix
     
 
 📂 Project Structure
 --------------------
-
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   .  ├── dashboard/        # Visualizations, regime plots  ├── models/           # Trained models & scalers  ├── src/              # Feature engineering + training scripts  ├── main.py           # Entry point for pipeline  ├── requirements.txt  # Dependencies  └── README.md   `
+├── dashboard/        # Visualizations, regime plots  
+├── models/           # Trained models & scalers  
+├── src/              # Feature engineering + training scripts  
+├── main.py           # End-to-end pipeline execution  
+├── requirements.txt  # Dependencies  
+└── README.md
 
 ⚙️ Workflow
 -----------
 
-1.  **Data Fetching**
-    
-    *   Download OHLCV data from Binance API.
-        
-    *   Build dataset with multiple timeframes (5m, 15m, 1h).
-        
-2.  **Feature Engineering**
-    
-    *   Compute technical indicators (momentum, volatility, trend).
-        
-    *   Normalize & scale features for ML.
-        
-3.  **Regime Labeling with HMM**
-    
-    *   Hidden Markov Model with PCA reduction.
-        
-    *   Hyperparameter tuning for states/components.
-        
-    *   Optimal config: **6 states, 4 PCA components (lowest BIC score)**.
-        
-4.  **LSTM Classification**
-    
-    *   Train LSTM on HMM-labeled data.
-        
-    *   Perform hyperparameter tuning (via Keras Tuner).
-        
-    *   Evaluate via Recall, Precision, F1, and Confusion Matrix.
-        
-5.  **Model Export**
-    
-    *   Save trained model + scaler for reuse.
-        
-    *   Integrate into live trading pipelines.
+1. **Data Fetching**
+
+    * Periodically fetches OHLCV data from Binance.
+
+    * Currently optimized for 5m data (can be adapted for other timeframes).
+
+2. **Feature Engineering**
+
+    Calculates multi-timeframe indicators: momentum, trend, volatility.
+
+    Scales and normalizes data for ML pipelines.
+
+3. **Regime Discovery (HMM)**
+
+    PCA-reduced features used for Hidden Markov Model labeling.
+
+    Optimal configuration: 6 states, 4 PCA components (lowest BIC).
+
+4. **Regime Prediction (LSTM)**
+
+    Sequence model trained on HMM labels.
+
+    Hyperparameter tuning via Keras Tuner.
+
+    Planned: probabilistic regime outputs (distribution across states).
+
+5. **Model Export & Live Integration**
+
+    Saves trained LSTM + scaler for downstream usage.
+
+    Periodically classifies current market regime.
+
+    Future: direct integration with Dazai’s trading logic.
         
 
 📊 Results
@@ -89,32 +102,31 @@ Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQL
 🔮 Future Work
 --------------
 
-*   Real-time integration with live trading system.
-    
-*   Reinforcement Learning for **dynamic position sizing**.
-    
-*   Expanded dashboard with explainability tools (feature importance, transition probabilities).
-    
-*   Experiment with alternative regime discovery methods (e.g., clustering, Bayesian HMM).
+*    Probabilistic regime predictions for richer decision-making.
+
+*    Real-time integration with live trading pipelines.
+
+*    Reinforcement Learning for adaptive position sizing.
+
+*    Explainability layer (feature importance, transition probabilities).
+
+*    Exploration of alternative regime discovery techniques (Bayesian HMM, clustering).
     
 
 🛠️ Installation
 ----------------
+git clone https://github.com/akash-kumar5/CryptoMarket_Regime_Classifier.git
+cd CryptoMarket_Regime_Classifier
+pip install -r requirements.txt
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   git clone https://github.com/akash-kumar5/CryptoMarket_Regime_Classifier.git  cd CryptoMarket_Regime_Classifier  pip install -r requirements.txt   `
 
 ▶️ Usage
 --------
 
 Run the full pipeline:
 
-Plain textANTLR4BashCC#CSSCoffeeScriptCMakeDartDjangoDockerEJSErlangGitGoGraphQLGroovyHTMLJavaJavaScriptJSONJSXKotlinLaTeXLessLuaMakefileMarkdownMATLABMarkupObjective-CPerlPHPPowerShell.propertiesProtocol BuffersPythonRRubySass (Sass)Sass (Scss)SchemeSQLShellSwiftSVGTSXTypeScriptWebAssemblyYAMLXML`   python main.py   `
+python main.py
 
-Or train components separately:
-
-*   src/hmm\_tuning.py – Tune Hidden Markov Model.
-    
-*   src/lstm\_train.py – Train LSTM on labeled data.
     
 
 Models & scalers will be saved in /models for reuse.
@@ -126,4 +138,4 @@ Models & scalers will be saved in /models for reuse.
     
 *   Designed as a **research + foundational tool** for live trading systems.
     
-*   Separate repo will handle **live market testing**.
+*   Future versions will connect directly into **Dazai** as a core regime intelligence component.
