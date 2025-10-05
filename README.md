@@ -1,6 +1,6 @@
 CryptoMarket Regime Classifier
-Adaptive Market Intelligence for Crypto Strategies
 ==============================
+**Adaptive Market Intelligence for Crypto Strategies**
 
 Trading strategies don’t exist in a vacuum — they succeed or fail depending on the market regime they operate in. A breakout strategy that crushes in a trending market will bleed in a choppy one.
 
