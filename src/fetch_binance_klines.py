@@ -6,7 +6,7 @@ import time
 
 def fetch_binance_klines(symbol="BTCUSDT", interval="5m", start_time_ms=None, limit=1000):
     url = "https://api.binance.com/api/v3/klines"
-    # limit = 1000  # Max limit per request
+    limit = 1000  # Max limit per request
     all_data = []
 
     if start_time_ms is None:

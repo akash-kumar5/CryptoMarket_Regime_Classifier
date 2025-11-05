@@ -1,0 +1,45 @@
+Price / Return based (raw movement)
+open_5m
+high_5m
+low_5m
+close_5m
+open_15m
+high_15m
+low_15m
+close_15m
+log_ret_1_5m
+log_ret_1_15m
+max_tick_ret_5m
+These capture directionality and candle structure.
+------
+Trend / Directional Strength (trend-phase)-measures persistent direction; are we trending or ranging?
+ema_ratio_9_21_5m
+macd_hist_5m
+adx_5m
+ema_ratio_9_21_15m
+macd_hist_15m
+adx_15m
+Trend strength and momentum.
+--------------
+Volatility / Range / Squeeze (volatility-phase)-how wide or compressed price movement is.
+atr_norm_5m
+bb_width_5m
+atr_norm_15m
+bb_width_15m
+Perfect for detecting squeeze vs expansion.
+-----
+Volume & participation (effort)-who is active and how strong the move is in volume terms.
+volume_5m
+trade_count_5m
+volume_zscore_50_5m
+volume_15m
+volume_zscore_50_15m
+-----
+Microstructure / Orderflow / Flow imbalance-real buying vs selling aggression.
+volume_5m_from_agg
+vwap_all_5m
+taker_buy_vol_5m
+taker_buy_ratio_5m
+trade_imbalance_5m
+vwap_skew_5m
+This group is extremely powerful for regime detection.
