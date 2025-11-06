@@ -49,70 +49,80 @@ def train_hmm(features, n_states=3, n_iter=150, random_state=42):
 
 def map_states_to_regimes(df, labels, main_tf='5m'):
     """
-    Map HMM states -> interpretable regimes using volatility (ATR-normalized) and trend (ADX).
-    If required columns are missing, fall back to ordinal mapping by volatility proxy when possible.
+    Map HMM states -> interpretable regimes for the 6-state case:
+      Squeeze, Range, Weak Trend, Strong Trend, Choppy High-Vol, Volatility Spike
+    Uses ATR-normalized (volatility) and ADX (trend strength). Fully deterministic.
     """
+    import numpy as np
+    import pandas as pd
+
     df_labeled = df.copy()
     df_labeled['state'] = labels
-    n_states = len(np.unique(labels))
+    n_states = int(len(np.unique(labels)))
 
     vol_col = f'atr_norm_{main_tf}'
+    bb_col  = f'bb_width_{main_tf}'
     trend_col = f'adx_{main_tf}'
 
-    # if missing columns, fall back to simple mapping
-    if vol_col not in df_labeled.columns or trend_col not in df_labeled.columns:
-        order = (
-            df_labeled.groupby('state')['state'].count().sort_values(ascending=True).index.tolist()
-            if vol_col not in df_labeled.columns else
-            df_labeled.groupby('state')[vol_col].mean().sort_values().index.tolist()
-        )
+    # ---- fallbacks if required columns missing
+    if trend_col not in df_labeled.columns:
+        # no ADX -> purely ordinal by volatility
+        base = vol_col if vol_col in df_labeled.columns else (bb_col if bb_col in df_labeled.columns else None)
+        if base is None:
+            return {s: f"State_{i}" for i, s in enumerate(sorted(df_labeled['state'].unique()))}
+        order = df_labeled.groupby('state')[base].mean().sort_values().index.tolist()
+        names = ["Squeeze","Range","Weak Trend","Strong Trend","Choppy High-Vol","Volatility Spike"]
+        return {s: (names[i] if i < len(names) else f"State_{i}") for i, s in enumerate(order)}
+
+    if vol_col not in df_labeled.columns and bb_col not in df_labeled.columns:
+        # no volatility proxy at all -> rank by trend only
+        order = df_labeled.groupby('state')[trend_col].mean().sort_values().index.tolist()
         return {s: f"State_{i}" for i, s in enumerate(order)}
 
-    state_stats = df_labeled.groupby('state')[[vol_col, trend_col]].mean()
-    state_stats = state_stats.sort_values(by=vol_col)  # low → high vol
+    # ---- choose volatility proxy (prefer ATR, else BB width)
+    vol_proxy = vol_col if vol_col in df_labeled.columns else bb_col
 
-    mapping = {}
+    # ---- compute per-state means
+    stats = df_labeled.groupby('state')[[vol_proxy, trend_col]].mean()
 
-    if n_states == 3:
-        mapping[state_stats.index[0]] = 'Squeeze'
-        # decide Range vs Trend using ADX
-        mid, high = state_stats.index[1], state_stats.index[2]
-        if state_stats.loc[mid, trend_col] >= state_stats.loc[high, trend_col]:
-            mapping[mid] = 'Range'; mapping[high] = 'Trend'
-        else:
-            mapping[mid] = 'Trend'; mapping[high] = 'Range'
+    if n_states != 6:
+        # generic mapping for other counts (keep existing behavior simple)
+        # low→high vol, then label generically
+        vol_order = stats.sort_values(by=vol_proxy).index.tolist()
+        return {s: f"State_{i}" for i, s in enumerate(vol_order)}
 
-    elif n_states == 4:
-        # lowest vol → Squeeze; highest vol → High-Vol Trend/Spike
-        mapping[state_stats.index[0]] = 'Squeeze'
-        mapping[state_stats.index[-1]] = 'High-Vol Trend'
-        mid1, mid2 = state_stats.index[1], state_stats.index[2]
-        if state_stats.loc[mid1, trend_col] >= state_stats.loc[mid2, trend_col]:
-            mapping[mid1] = 'Range'; mapping[mid2] = 'Mid-Vol Trend'
-        else:
-            mapping[mid1] = 'Mid-Vol Trend'; mapping[mid2] = 'Range'
+    # =========================
+    # 6-STATE DETERMINISTIC MAP
+    # =========================
 
-    elif n_states == 6:
-        # 0: Squeeze, 5: Vol Spike, mids split by ADX
-        mapping[state_stats.index[0]] = 'Squeeze'
-        mapping[state_stats.index[-1]] = 'Volatility Spike'
-        mids = state_stats.index[1:-1].tolist()
-        # sort mids by ADX to separate trends vs range
-        mids_sorted = state_stats.loc[mids].sort_values(by=trend_col).index.tolist()
-        # low-mid (range-ish), mid (weak trend), high-mid (strong trend), high (choppy high vol)
-        if len(mids_sorted) == 4:
-            mapping[mids_sorted[0]] = 'Range'
-            mapping[mids_sorted[1]] = 'Weak Trend'
-            mapping[mids_sorted[2]] = 'Strong Trend'
-            mapping[mids_sorted[3]] = 'Choppy High-Vol'
-        else:
-            # fallback
-            for i, s in enumerate(mids_sorted):
-                mapping[s] = f"Mid_{i}"
+    # sort states by volatility (ascending)
+    vol_order = stats.sort_values(by=vol_proxy).index.tolist()
 
-    else:
-        # generic fallback
-        for i, s in enumerate(state_stats.index):
-            mapping[s] = f"State_{i}"
+    # extremes
+    squeeze  = vol_order[0]
+    vol_spike = vol_order[-1]
 
+    # four middle states
+    mids = vol_order[1:-1]
+    # split into low-vol band (2) and high-vol band (2) by volatility rank
+    low_band  = mids[:2]
+    high_band = mids[2:]
+
+    # within each band, use ADX to split
+    # low band: lower ADX -> Range ; higher ADX -> Weak Trend
+    low_band_sorted = stats.loc[low_band].sort_values(by=trend_col).index.tolist()
+    rng, weak_trend = low_band_sorted[0], low_band_sorted[1]
+
+    # high band: lower ADX -> Choppy High-Vol ; higher ADX -> Strong Trend
+    high_band_sorted = stats.loc[high_band].sort_values(by=trend_col).index.tolist()
+    choppy, strong_trend = high_band_sorted[0], high_band_sorted[1]
+
+    mapping = {
+        squeeze:        'Squeeze',
+        rng:            'Range',
+        weak_trend:     'Weak Trend',
+        strong_trend:   'Strong Trend',
+        choppy:         'Choppy High-Vol',
+        vol_spike:      'Volatility Spike',
+    }
     return mapping

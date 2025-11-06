@@ -77,30 +77,36 @@ def load_data(symbol, interval, start_date, end_date):
 def merge_timeframes(symbol, main_tf='5m', start_date=None, end_date=None, context_tfs=None, klines_map: dict = None):
     if context_tfs is None:
         context_tfs = ['1m']
-    if not klines_map:
-        klines_map = {}
+    klines_map = klines_map or {}
 
+    # load main
     df_main = klines_map.get(main_tf)
     if isinstance(df_main, str):
         try:
             df_main = pd.read_csv(df_main, parse_dates=['timestamp'])
         except Exception:
             df_main = None
-    df_main = _normalize_klines_df(df_main) if df_main is not None else load_data(symbol, main_tf, start_date, end_date)
 
+    df_main = _normalize_klines_df(df_main) if df_main is not None else load_data(symbol, main_tf, start_date, end_date)
     if df_main is None or df_main.empty:
         print(f"Main timeframe ({main_tf}) data could not be loaded. Cannot merge.")
         return None
 
+    main_tf_freq = to_pandas_freq(main_tf)
+    main_tf_seconds = interval_to_seconds(main_tf)
+
+    # enforce period start on index
+    df_main.index = df_main.index.floor(main_tf_freq)
+    if df_main.index.tz:
+        df_main.index = df_main.index.tz_convert(None)
+
     df_main = df_main.rename(columns={
         'open': f'open_{main_tf}', 'high': f'high_{main_tf}',
-        'low': f'low_{main_tf}', 'close': f'close_{main_tf}',
+        'low': f'low_{main_tf}',  'close': f'close_{main_tf}',
         'volume': f'volume_{main_tf}'
     })
-    merged_df = df_main.copy()
 
-    main_tf_seconds = interval_to_seconds(main_tf)
-    main_tf_freq = to_pandas_freq(main_tf)
+    merged_df = df_main.copy()
 
     for tf in context_tfs:
         df_context = klines_map.get(tf)
@@ -109,37 +115,54 @@ def merge_timeframes(symbol, main_tf='5m', start_date=None, end_date=None, conte
                 df_context = pd.read_csv(df_context, parse_dates=['timestamp'])
             except Exception:
                 df_context = None
+
         df_context = _normalize_klines_df(df_context) if df_context is not None else load_data(symbol, tf, start_date, end_date)
         if df_context is None or df_context.empty:
             print(f"Skipping {tf} — no data")
             continue
 
+        tf_freq = to_pandas_freq(tf)
+        tf_seconds = interval_to_seconds(tf)
+
+        df_context.index = df_context.index.floor(tf_freq)
+        if df_context.index.tz:
+            df_context.index = df_context.index.tz_convert(None)
+
         df_context = df_context.rename(columns={
             'open': f'open_{tf}', 'high': f'high_{tf}',
-            'low': f'low_{tf}', 'close': f'close_{tf}',
+            'low': f'low_{tf}',  'close': f'close_{tf}',
             'volume': f'volume_{tf}'
         })
-        tf_seconds = interval_to_seconds(tf)
+
         if tf_seconds < main_tf_seconds:
             agg_rules = {
                 f'open_{tf}': 'first', f'high_{tf}': 'max',
-                f'low_{tf}': 'min', f'close_{tf}': 'last',
+                f'low_{tf}': 'min',   f'close_{tf}': 'last',
                 f'volume_{tf}': 'sum'
             }
-            df_agg = df_context.resample(main_tf_freq).agg(agg_rules)
+            df_agg = df_context.resample(main_tf_freq, label='left', closed='left').agg(agg_rules)
             merged_df = merged_df.merge(df_agg, left_index=True, right_index=True, how='left')
+
         elif tf_seconds > main_tf_seconds:
-            df_resampled = df_context.reindex(merged_df.index, method='ffill')
-            merged_df = merged_df.merge(df_resampled, left_index=True, right_index=True, how='left')
+            left = merged_df.index.to_frame(index=False).rename(columns={0: "timestamp"})
+            right = df_context.index.to_frame(index=False).rename(columns={0: "timestamp"}).join(
+                df_context.reset_index(drop=True)
+            )
+
+            ctx_cols = [c for c in right.columns if c != 'timestamp']
+            asof = pd.merge_asof(
+                left.sort_values("timestamp"),
+                right[['timestamp'] + ctx_cols].sort_values("timestamp"),
+                on='timestamp', direction='backward'
+            ).set_index('timestamp')
+
+            merged_df = merged_df.merge(asof, left_index=True, right_index=True, how='left')
+
         else:
             merged_df = merged_df.merge(df_context, left_index=True, right_index=True, how='left')
 
-    merged_df.fillna(method='ffill', inplace=True)
-    main_cols = [f'open_{main_tf}', f'close_{main_tf}', f'high_{main_tf}', f'low_{main_tf}']
-    if any(c in merged_df.columns for c in main_cols):
-        merged_df = merged_df.dropna(subset=[c for c in main_cols if c in merged_df.columns], how='all')
-    else:
-        merged_df = merged_df.dropna(how='all')
+    merged_df = merged_df.sort_index().ffill()
 
     merged_df = merged_df.reset_index().rename(columns={'index': 'timestamp'})
     return merged_df
+

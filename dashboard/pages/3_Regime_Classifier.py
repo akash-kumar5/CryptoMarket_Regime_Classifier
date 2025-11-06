@@ -40,7 +40,7 @@ default_features = ['atr_norm_5m', 'bb_width_5m', 'adx_5m', 'volume_zscore_50_5m
 
 available_features = [
     c for c in df.columns
-    if c != 'timestamp' and not c.startswith(('open_', 'high_', 'low_', 'close_', 'volume_'))
+    if c != 'timestamp' and not c.startswith(('open_', 'high_', 'low_', 'close_'))
 ]
 hmm_features = st.multiselect(
     "Select features for HMM",
@@ -170,7 +170,7 @@ if 'labeled_df' in st.session_state:
 
     # Save labeled data
     st.subheader("Save outputs")
-    save_name = selected_file.replace('_features.csv', f'_labeled_states{n_components}.csv')
+    save_name = selected_file.replace('_features.csv', f'_states{n_components}_labeled.csv')
     save_path = os.path.join(DATA_FOLDER, save_name)
     if st.button(f"Save labeled CSV as `{save_name}`"):
         labeled_df.to_csv(save_path, index=False)
