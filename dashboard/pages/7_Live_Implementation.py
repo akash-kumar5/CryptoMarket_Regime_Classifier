@@ -1,199 +1,231 @@
-# streamlit_app.py
-import streamlit as st
-import pandas as pd
-import numpy as np
-import time
-import io
-from datetime import datetime, timezone
-import plotly.graph_objects as go
-import os, sys
+# live_implementation.py
 
-# Import the pipeline and constants from your main.py
+import os
+import sys
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# -------------------------------------------
+# imports and setup
+# -------------------------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-from src.live_inference import MODEL_FOLDER, SYMBOL, MAIN_TF, CONTEXT_TFS, TIME_STEPS, LiveInferencePipeline
+
+from src.live_inference import (
+    MODEL_FOLDER,
+    SYMBOL,
+    MAIN_TIMEFRAME,
+    CONTEXT_TIMEFRAMES,
+    TIME_STEPS,
+    LiveInferencePipeline,
+)
+from src.data_cleaner import merge_timeframes, to_pandas_freq
+from src.compute_features import build_features
 
 st.set_page_config(page_title="Live Regime Classification", layout="wide")
 
-# ---------------------------
-# Sidebar / Controls
-# ---------------------------
+# -------------------------------------------------------------------
+# sidebar / controls
+# -------------------------------------------------------------------
 st.sidebar.title("Controls")
 model_folder = st.sidebar.text_input("Model folder", MODEL_FOLDER)
 symbol = st.sidebar.text_input("Symbol", SYMBOL)
-main_tf = st.sidebar.selectbox("Main timeframe", [MAIN_TF], index=0, disabled=True)
-context_tfs = st.sidebar.multiselect("Context timeframes", CONTEXT_TFS, default=CONTEXT_TFS)
-seq_len = st.sidebar.number_input("Sequence length (TIME_STEPS)", min_value=16, max_value=512, value=TIME_STEPS, step=1)
+sequence_length = st.sidebar.number_input(
+    "Sequence length", min_value=16, max_value=512, value=TIME_STEPS, step=1
+)
 
-st.sidebar.markdown("---")
-refresh_seconds = st.sidebar.slider("Live refresh (seconds)", min_value=5, max_value=60, value=10)
+auto_refresh_seconds = st.sidebar.slider("Auto refresh (seconds)", min_value=5, max_value=60, value=10)
 live_toggle = st.sidebar.checkbox("Live (auto refresh)", value=False)
-simulate_mode = st.sidebar.checkbox("Simulate (replay historical)", value=False)
-run_once_btn = st.sidebar.button("Run once (fetch closed candles)")
+run_once_button = st.sidebar.button("Run once (closed candle only)")
+clear_audit_button = st.sidebar.button("Clear audit log")
 
-st.sidebar.markdown("---")
-st.sidebar.write("Quick actions")
-clear_log_btn = st.sidebar.button("Clear audit log")
-
-# ---------------------------
-# Cached pipeline loader
-# ---------------------------
+# -------------------------------------------------------------------
+# cached model loader
+# -------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
-def load_pipeline(model_folder_path: str):
-    model_file = model_folder_path.rstrip("/") + "/lstm_regime_model.keras"
-    scaler_file = model_folder_path.rstrip("/") + "/scaler.joblib"
-    meta_file = model_folder_path.rstrip("/") + "/lstm_model_metadata.json"
-    pipeline = LiveInferencePipeline(model_file, scaler_file, meta_file)
-    return pipeline
+def load_pipeline(folder_path: str) -> LiveInferencePipeline:
+    model_file = folder_path.rstrip("/") + "/lstm_regime_model.keras"
+    scaler_file = folder_path.rstrip("/") + "/scaler.joblib"
+    metadata_file = folder_path.rstrip("/") + "/lstm_model_metadata.json"
+    return LiveInferencePipeline(model_file, scaler_file, metadata_file)
 
-# instantiate pipeline
 try:
     pipeline = load_pipeline(model_folder)
-except Exception as e:
-    st.error(f"Failed to load pipeline: {e}")
+except Exception as exc:
+    st.error(f"Failed to load model: {exc}")
     st.stop()
 
-# ---------------------------
-# Session state for logs and simulate pointer
-# ---------------------------
+# -------------------------------------------------------------------
+# audit / session state
+# -------------------------------------------------------------------
 if "audit_log" not in st.session_state:
-    st.session_state.audit_log = []  # list of dicts
-if "simulate_index" not in st.session_state:
-    st.session_state.simulate_index = None
-if "last_prediction" not in st.session_state:
-    st.session_state.last_prediction = None
-if clear_log_btn:
     st.session_state.audit_log = []
 
-# ---------------------------
-# Helper: perform prediction and return structured info
-# ---------------------------
-from src.data_cleaner import merge_timeframes
-from src.compute_features import build_features
+if clear_audit_button:
+    st.session_state.audit_log = []
 
-def do_prediction(fetch_open_candle: bool = False):
+# -------------------------------------------------------------------
+# utilities (full, explicit naming)
+# -------------------------------------------------------------------
+def floor_and_standardize_ohlcv(raw_dataframe: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """
-    Calls pipeline.run_prediction_cycle to update internal data_store,
-    then builds features and makes a prediction (so we can capture results/DFs).
-    Returns dict: {predicted_regime, confidence, probs, features_df, merged_df, timestamp}
+    Convert raw kline frame (possibly using short column names) into:
+    timestamp/open/high/low/close/volume with tz-aware UTC and floored timestamp.
     """
-    # run to update internal data_store (prints too)
-    pipeline.run_prediction_cycle(fetch_open_candle=fetch_open_candle)
-
-    # build merged and features (same logic as main)
-    main_df = pipeline.data_store[MAIN_TF]
-    context_dfs = {tf: pipeline.data_store[tf] for tf in CONTEXT_TFS}
-    merged_df = merge_timeframes(MAIN_TF, main_df, context_dfs)
-    features_df = build_features(merged_df, main_tf=MAIN_TF, context_tfs=CONTEXT_TFS)
-
-    result = {"ok": False}
-    if len(features_df) < seq_len:
-        result["message"] = f"Not enough data: have {len(features_df)}, need {seq_len}"
-        return result
-
-    final_features = features_df[pipeline.feature_cols]
-    sequence_data = final_features.tail(seq_len)
-    scaled_sequence = pipeline.scaler.transform(sequence_data)
-    input_sequence = np.expand_dims(scaled_sequence, axis=0)
-
-    prediction_probs = pipeline.model.predict(input_sequence, verbose=0)[0]
-    predicted_class_index = int(np.argmax(prediction_probs))
-    predicted_regime = pipeline.regime_map.get(predicted_class_index, "Unknown")
-    confidence = float(prediction_probs[predicted_class_index])
-
-    # friendly probabilities mapping
-    probs_map = {}
-    for regime_name, index in pipeline.metadata["regime_map"].items():
-        probs_map[regime_name] = float(prediction_probs[int(index)])
-
-    timestamp = features_df['t'].iloc[-1] if 't' in features_df.columns else datetime.now(timezone.utc)
-
-    result.update({
-        "ok": True,
-        "predicted_regime": predicted_regime,
-        "confidence": confidence,
-        "probs": probs_map,
-        "features_df": features_df,
-        "merged_df": merged_df,
-        "timestamp": timestamp
-    })
-    return result
-
-# ---------------------------
-# UI layout
-# ---------------------------
-st.title("Live Regime Classification — Demo")
-top_col, right_col = st.columns([3,1])
-
-with top_col:
-    st.subheader(f"{symbol} — {MAIN_TF} | Sequence: {seq_len}")
-
-with right_col:
-    if st.button("Download audit log (CSV)"):
-        if len(st.session_state.audit_log) == 0:
-            st.warning("Audit log empty.")
-        else:
-            df_log = pd.DataFrame(st.session_state.audit_log)
-            csv = df_log.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", csv, file_name="audit_log.csv", mime="text/csv")
-
-# ---------------------------
-# Simulation mode: prefill pointer if needed
-# ---------------------------
-if simulate_mode:
-    # If simulation mode, we use historical main_df and advance pointer on each refresh
-    hist_main = pipeline.data_store[MAIN_TF].copy()
-    if st.session_state.simulate_index is None:
-        st.session_state.simulate_index = max(0, len(hist_main) - 500)  # start a bit in the past
-
-# ---------------------------
-# Action: run once button
-# ---------------------------
-if run_once_btn:
-    res = do_prediction(fetch_open_candle=False)
-    if not res.get("ok", False):
-        st.warning(res.get("message", "Prediction failed"))
-    else:
-        # append to audit log
-        log_entry = {
-            "timestamp": str(res["timestamp"]),
-            "regime": res["predicted_regime"],
-            "confidence": res["confidence"],
-            **{f"p_{k}": v for k, v in res["probs"].items()}
+    pandas_freq = to_pandas_freq(timeframe)  # e.g. "5m" -> "5T"
+    dataframe = raw_dataframe.rename(
+        columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume",
         }
-        st.session_state.audit_log.append(log_entry)
-        st.session_state.last_prediction = res
+    ).copy()
 
-# ---------------------------
-# Live auto-refresh logic
-# ---------------------------
+    # ensure tz-aware UTC and floor to timeframe period start
+    dataframe["timestamp"] = pd.to_datetime(dataframe["timestamp"], utc=True).dt.floor(pandas_freq)
+    dataframe = dataframe[["timestamp", "open", "high", "low", "close", "volume"]]
+    return dataframe
+
+
+def drop_last_if_candle_unclosed(ohlcv_dataframe: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Drop last bar if its close time hasn't arrived yet, based on timeframe (e.g., '5m', '1m', '15m').
+    All timestamps are expected tz-aware UTC.
+    """
+    if ohlcv_dataframe.empty:
+        return ohlcv_dataframe
+
+    if not isinstance(ohlcv_dataframe["timestamp"].dtype, pd.DatetimeTZDtype):
+        # normalize to tz-aware UTC if somehow naive crept in
+        ohlcv_dataframe = ohlcv_dataframe.copy()
+        ohlcv_dataframe["timestamp"] = pd.to_datetime(ohlcv_dataframe["timestamp"], utc=True)
+
+    try:
+        minutes = int(timeframe[:-1])
+    except Exception:
+        raise ValueError(f"Unsupported timeframe format: {timeframe}")
+
+    last_bar_start = ohlcv_dataframe["timestamp"].iloc[-1]
+    now_utc = pd.Timestamp.now(tz="UTC")
+    close_due = last_bar_start + pd.Timedelta(minutes=minutes)
+    return ohlcv_dataframe.iloc[:-1] if now_utc < close_due else ohlcv_dataframe
+
+
+def latest_timestamp_from_features(features: pd.DataFrame) -> pd.Timestamp:
+    """
+    Robustly fetch the latest timestamp from features:
+    - Prefer 'timestamp' column if present
+    - Else fallback to index (if DatetimeIndex)
+    """
+    if "timestamp" in features.columns:
+        return pd.to_datetime(features["timestamp"].iloc[-1], utc=True)
+    if isinstance(features.index, pd.DatetimeIndex):
+        return pd.to_datetime(features.index[-1], utc=True)
+    # final fallback to row name if it is datetime-like
+    return pd.to_datetime(features.iloc[-1].name, utc=True)
+
+
+# -------------------------------------------------------------------
+# prediction runner
+# -------------------------------------------------------------------
+def run_prediction(fetch_open_candles: bool = False):
+    """
+    Refresh pipeline data, merge across timeframes, build features,
+    and run a single prediction with the cached model & scaler.
+    """
+    pipeline.refresh_data(fetch_open_candles=fetch_open_candles)
+
+    main_frame = drop_last_if_candle_unclosed(
+        floor_and_standardize_ohlcv(pipeline.data_store[MAIN_TIMEFRAME], MAIN_TIMEFRAME),
+        MAIN_TIMEFRAME,
+    )
+
+    context_frames_map = {
+        timeframe: drop_last_if_candle_unclosed(
+            floor_and_standardize_ohlcv(pipeline.data_store[timeframe], timeframe),
+            timeframe,
+        )
+        for timeframe in CONTEXT_TIMEFRAMES
+    }
+
+    merged = merge_timeframes(
+        symbol=symbol,
+        main_tf=MAIN_TIMEFRAME,
+        context_tfs=CONTEXT_TIMEFRAMES,
+        klines_map={MAIN_TIMEFRAME: main_frame, **context_frames_map},
+    )
+
+    features = build_features(
+        merged,
+        main_tf=MAIN_TIMEFRAME,
+        context_tfs=CONTEXT_TIMEFRAMES,
+    )
+
+    # ensure we have a 'timestamp' column for logging
+    if "timestamp" not in features.columns:
+        if isinstance(features.index, pd.DatetimeIndex) or "index" in features.columns:
+            features = features.reset_index().rename(columns={"index": "timestamp"})
+        else:
+            if "timestamp" in merged.columns:
+                features["timestamp"] = merged["timestamp"]
+            else:
+                raise RuntimeError("No timestamp available on features or merged data.")
+
+    # validate sequence window
+    if len(features) < sequence_length or features.tail(sequence_length).isna().any().any():
+        return None, "Not enough valid feature rows yet"
+
+    model_input_window = features[pipeline.feature_columns].tail(sequence_length)
+    model_input_scaled = pipeline.scaler.transform(model_input_window)
+    model_input_batched = np.expand_dims(model_input_scaled, axis=0)
+
+    probabilities = pipeline.model.predict(model_input_batched, verbose=0)[0]
+    class_index = int(np.argmax(probabilities))
+    predicted_regime = pipeline.regime_map.get(class_index, "Unknown")
+
+    last_ts = latest_timestamp_from_features(features)
+
+    return {
+        "timestamp": last_ts,
+        "regime": predicted_regime,
+        "confidence": float(probabilities[class_index]),
+        "probs": {
+            regime_name: float(probabilities[int(class_id)])
+            for regime_name, class_id in pipeline.metadata["regime_map"].items()
+        },
+    }, None
+
+
+# -------------------------------------------------------------------
+# UI
+# -------------------------------------------------------------------
+st.title("Live Regime Classification")
+
+if run_once_button:
+    result, message = run_prediction(fetch_open_candles=False)
+    if result:
+        st.session_state.audit_log.append(result)
+    else:
+        st.warning(message)
+
 from streamlit_autorefresh import st_autorefresh
 
 if live_toggle:
-    # autorefresh every refresh_seconds
-    count = st_autorefresh(interval=refresh_seconds * 1000, key="live_refresh")
-    # run prediction on each refresh
-    res = do_prediction(fetch_open_candle=True)
-    if res.get("ok", False):
-        log_entry = {
-            "timestamp": str(res["timestamp"]),
-            "regime": res["predicted_regime"],
-            "confidence": res["confidence"],
-            **{f"p_{k}": v for k, v in res["probs"].items()}
-        }
-        st.session_state.audit_log.append(log_entry)
-        st.session_state.last_prediction = res
-    else:
-        st.warning(res.get("message", "Live prediction skipped"))
+    st_autorefresh(interval=auto_refresh_seconds * 1000, key="refresh_live")
+    result, message = run_prediction(fetch_open_candles=True)
+    if result:
+        st.session_state.audit_log.append(result)
+    elif message:
+        st.warning(message)
 
-# ---------------------------
-# Simulate mode step (advance pointer and run prediction from simulated data)
-# ---------------------------
-if simulate_mode and not live_toggle and not run_once_btn:
-    # advance pointer
-    st.session_state.simulate_index += 1
-    hist_main = pipeline.data_store[MAIN_TF].copy()
-    idx = min(st.session_state.simulate_index, len(hist_main)-1)
-    # trim each timeframe to that index to mimic "current time"
-    for tf in [MAIN_TF] + CONTEXT_TFS:
-        df = pipeline.data_store[tf]
-        # cut by index
+# display last prediction
+if st.session_state.audit_log:
+    latest = st.session_state.audit_log[-1]
+    st.subheader(f"Current Regime: {latest['regime']} — {latest['confidence']:.2%}")
+
+st.dataframe(pd.DataFrame(st.session_state.audit_log))
